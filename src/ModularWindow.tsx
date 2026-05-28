@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./ModularWindow.css";
+import { WorldState, TIMER_LABELS, getTimerInfo, fmtMs, FissureWatch, matchesWatch } from "./TimerHelper";
 
 interface CatalogItem {
   unique_name: string;
@@ -67,6 +68,10 @@ interface Props {
   favorites: string[];
   onFavoritesChange: (newOrder: string[]) => void;
   onUnfavorite: (id: string) => void;
+  timerFavorites: string[];
+  onTimerFavoritesChange: (newOrder: string[]) => void;
+  onTimerUnfavorite: (id: string) => void;
+  fissureWatches: FissureWatch[];
   quantities: Record<string, number>;
   catalog: CatalogItem[];
   width?: number;
@@ -78,6 +83,8 @@ interface Props {
 export default function ModularWindow({
   tracked, onTrackedChange, onUntrack,
   favorites, onFavoritesChange, onUnfavorite,
+  timerFavorites, onTimerFavoritesChange, onTimerUnfavorite,
+  fissureWatches,
   quantities, catalog, width, onWidthChange,
   sectionOrder, onSectionOrderChange,
 }: Props) {
@@ -85,6 +92,8 @@ export default function ModularWindow({
   const [trackedRecipes, setTrackedRecipes] = useState<Map<string, RecipeComponent[]>>(new Map());
   const [trackingView, setTrackingView] = useState<"need" | "all">("need");
   const [collapsedReqs, setCollapsedReqs] = useState<Set<string>>(new Set());
+  const [worldState, setWorldState] = useState<WorldState | null>(null);
+  const [timerNow, setTimerNow] = useState(Date.now());
 
   const toggleCollapsedReqs = useCallback((id: string) => {
     setCollapsedReqs(prev => {
@@ -125,6 +134,19 @@ export default function ModularWindow({
       });
     });
   }, [tracked]); // eslint-disable-line
+
+  useEffect(() => {
+    if (!sectionOrder.includes("timers")) return;
+    const fetch_ = () => invoke<WorldState>("fetch_worldstate").then(setWorldState).catch(() => {});
+    fetch_();
+    const iv = setInterval(fetch_, 60000);
+    return () => clearInterval(iv);
+  }, [sectionOrder]);
+
+  useEffect(() => {
+    const iv = setInterval(() => setTimerNow(Date.now()), 1000);
+    return () => clearInterval(iv);
+  }, []);
 
   const perItemNeeds = useMemo(() => {
     return tracked.map(id => {
@@ -189,6 +211,14 @@ export default function ModularWindow({
     [next[idx], next[target]] = [next[target], next[idx]];
     onFavoritesChange(next);
   }, [favorites, onFavoritesChange]);
+
+  const moveTimer = useCallback((idx: number, dir: -1 | 1) => {
+    const next = [...timerFavorites];
+    const target = idx + dir;
+    if (target < 0 || target >= next.length) return;
+    [next[idx], next[target]] = [next[target], next[idx]];
+    onTimerFavoritesChange(next);
+  }, [timerFavorites, onTimerFavoritesChange]);
 
   const moveSectionUp = useCallback((idx: number) => {
     if (idx === 0) return;
@@ -316,6 +346,36 @@ export default function ModularWindow({
     </div>
   );
 
+  const timersBody = (
+    timerFavorites.length === 0 ? (
+      <div className="modular-empty">Pin ☆ timers in the Timers tab to show them here.</div>
+    ) : (
+      <div className="modular-fav-list">
+        {timerFavorites.map((id, idx) => {
+          const info = worldState ? getTimerInfo(id, worldState, timerNow) : null;
+          const label = TIMER_LABELS[id] ?? id;
+          const remaining = info ? fmtMs(new Date(info.expiry).getTime() - timerNow) : "—";
+          return (
+            <div key={id} className="modular-fav-item">
+              <div className="modular-item-arrows">
+                <button className="modular-arrow-btn" disabled={idx === 0} onClick={() => moveTimer(idx, -1)} title="Move up">
+                  <svg viewBox="0 0 10 6" fill="none"><path d="M1 5L5 1L9 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                </button>
+                <button className="modular-arrow-btn" disabled={idx === timerFavorites.length - 1} onClick={() => moveTimer(idx, 1)} title="Move down">
+                  <svg viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                </button>
+              </div>
+              <span className="modular-fav-name">{label}</span>
+              {info && <span className="modular-timer-state">{info.state}</span>}
+              <span className="modular-fav-qty modular-timer-cd">{remaining}</span>
+              <button className="modular-fav-star" title="Remove" onClick={() => onTimerUnfavorite(id)}>★</button>
+            </div>
+          );
+        })}
+      </div>
+    )
+  );
+
   const sectionData: Record<string, { label: string; body: React.ReactElement; headerExtra?: React.ReactElement }> = {
     tracking: {
       label: `Tracking${tracked.length > 0 ? ` (${tracked.length})` : ""}`,
@@ -325,6 +385,55 @@ export default function ModularWindow({
     favorites: {
       label: `Favorites${favorites.length > 0 ? ` (${favorites.length})` : ""}`,
       body: favoritesBody,
+    },
+    timers: {
+      label: `Timers${timerFavorites.length > 0 ? ` (${timerFavorites.length})` : ""}`,
+      body: timersBody,
+    },
+    fissures: {
+      label: "Watched Fissures",
+      body: (() => {
+        if (fissureWatches.length === 0) {
+          return <div className="modular-empty">Add fissure watches in the Timers tab.</div>;
+        }
+        const TIER_COLOR: Record<string, string> = {
+          Lith: "#c8853a", Meso: "#a8a9ad", Neo: "#f0c040",
+          Axi: "#e5c04a", Requiem: "#9b6dff", Omnia: "#e0e0e0",
+        };
+        // Match each source array with explicit variant so checks are unambiguous
+        type MatchedFissure = { f: { tier: string; tierNum: number; missionType: string; enemy: string; node: string; expiry: string }; variant: "normal" | "hard" | "storm" };
+        const matched: MatchedFissure[] = [
+          ...(worldState?.fissures   ?? []).filter(f => fissureWatches.some(w => matchesWatch(w, f, "normal"))).map(f => ({ f, variant: "normal" as const })),
+          ...(worldState?.spFissures ?? []).filter(f => fissureWatches.some(w => matchesWatch(w, f, "hard"))).map(f => ({ f, variant: "hard" as const })),
+          ...(worldState?.voidStorms ?? []).filter(s => fissureWatches.some(w => matchesWatch(w, s, "storm"))).map(s => ({ f: s, variant: "storm" as const })),
+        ].sort((a, b) => a.f.tierNum - b.f.tierNum);
+
+        if (matched.length === 0) {
+          return <div className="modular-empty">No matching fissures active.</div>;
+        }
+        const variantLabel: Record<string, string> = { normal: "N", hard: "SP", storm: "Storm" };
+        return (
+          <div className="modular-fav-list">
+            {matched.map(({ f, variant }, i) => {
+              const ms = new Date(f.expiry).getTime() - timerNow;
+              return (
+                <div key={i} className="modular-fav-item" style={{ flexDirection: "column", alignItems: "stretch", padding: "4px 8px" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <span className="modular-fissure-tier" style={{ color: TIER_COLOR[f.tier] ?? "#ccc" }}>{f.tier}</span>
+                    <span className="modular-fav-name">{f.missionType}</span>
+                    <span style={{ fontSize: 10, color: "var(--muted)", flexShrink: 0 }}>{variantLabel[variant]}</span>
+                    <span className="modular-fav-qty modular-timer-cd" style={{ marginLeft: "auto" }}>{fmtMs(ms)}</span>
+                  </div>
+                  <div style={{ fontSize: 10, color: "var(--muted)", paddingLeft: 2, marginTop: 1 }}>
+                    {f.enemy && <span style={{ marginRight: 6 }}>{f.enemy}</span>}
+                    {f.node && <span>{f.node}</span>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        );
+      })(),
     },
   };
 

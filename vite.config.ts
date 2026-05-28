@@ -9,6 +9,11 @@ export default defineConfig(async () => ({
 
   clearScreen: false,
 
+  // Only scan src/ for dependencies — prevents Vite crawling src-tauri/target/
+  optimizeDeps: {
+    entries: ["src/**/*.{ts,tsx}"],
+  },
+
   build: {
     // Use terser for more aggressive minification in production builds
     minify: "terser",

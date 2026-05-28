@@ -295,3 +295,27 @@
   transition: color .1s;
 }
 .modular-fav-star:hover { color: rgba(139,148,158,.6); }
+
+/* ── Timer state badge in Modular Window ── */
+.modular-timer-state {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--muted);
+  flex-shrink: 0;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: rgba(255,255,255,.06);
+}
+
+.modular-fissure-tier {
+  font-size: 11px;
+  font-weight: 700;
+  flex-shrink: 0;
+  width: 46px;
+}
+
+.modular-timer-cd {
+  font-size: 11px !important;
+  min-width: 60px !important;
+  font-variant-numeric: tabular-nums;
+}

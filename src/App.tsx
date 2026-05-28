@@ -7,6 +7,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import Foundry from "./Foundry";
 import MarketHelper from "./MarketHelper";
 import RelicHelper from "./RelicHelper";
+import TimerHelper, { FissureWatch } from "./TimerHelper";
 import Overlay from "./Overlay";
 import ModularWindow from "./ModularWindow";
 import { HelpTip } from "./HelpTip";
@@ -73,7 +74,7 @@ interface InventoryUpdate {
   scanned_at: number;
 }
 
-type Module = "inventory" | "foundry" | "market" | "relics";
+type Module = "inventory" | "foundry" | "market" | "relics" | "timers";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -141,9 +142,11 @@ function timeStr(ts: number) {
 function ModularWindowPage() {
   const [tracked, setTracked] = useState<string[]>([]);
   const [favorites, setFavorites] = useState<string[]>([]);
+  const [timerFavorites, setTimerFavorites] = useState<string[]>([]);
+  const [fissureWatches, setFissureWatches] = useState<FissureWatch[]>([]);
   const [quantities, setQuantities] = useState<Record<string, number>>({});
   const [catalog, setCatalog] = useState<CatalogItem[]>([]);
-  const [sectionOrder, setSectionOrder] = useState<string[]>(["tracking", "favorites"]);
+  const [sectionOrder, setSectionOrder] = useState<string[]>(["tracking", "favorites", "timers", "fissures"]);
 
   useEffect(() => {
     invoke<string>("load_settings").then(json => {
@@ -152,7 +155,14 @@ function ModularWindowPage() {
         const s = JSON.parse(json);
         if (Array.isArray(s.tracked)) setTracked(s.tracked);
         if (Array.isArray(s.favorites)) setFavorites(s.favorites);
-        if (Array.isArray(s.modularSectionOrder)) setSectionOrder(s.modularSectionOrder);
+        if (Array.isArray(s.timerFavorites)) setTimerFavorites(s.timerFavorites);
+        if (Array.isArray(s.fissureWatches)) setFissureWatches(s.fissureWatches);
+        if (Array.isArray(s.modularSectionOrder)) {
+          const order: string[] = s.modularSectionOrder;
+          if (!order.includes("timers"))   order.push("timers");
+          if (!order.includes("fissures")) order.push("fissures");
+          setSectionOrder(order);
+        }
       } catch {}
     }).catch(() => {});
     invoke<CatalogItem[]>("get_all_items").then(setCatalog).catch(() => {});
@@ -174,6 +184,8 @@ function ModularWindowPage() {
           const s = JSON.parse(json);
           if (Array.isArray(s.tracked)) setTracked(s.tracked);
           if (Array.isArray(s.favorites)) setFavorites(s.favorites);
+          if (Array.isArray(s.timerFavorites)) setTimerFavorites(s.timerFavorites);
+          if (Array.isArray(s.fissureWatches)) setFissureWatches(s.fissureWatches);
           if (Array.isArray(s.modularSectionOrder)) setSectionOrder(s.modularSectionOrder);
         } catch {}
       }).catch(() => {});
@@ -240,6 +252,10 @@ function ModularWindowPage() {
         favorites={favorites}
         onFavoritesChange={handleFavoritesChange}
         onUnfavorite={handleUnfavorite}
+        timerFavorites={timerFavorites}
+        onTimerFavoritesChange={setTimerFavorites}
+        onTimerUnfavorite={id => setTimerFavorites(prev => prev.filter(x => x !== id))}
+        fissureWatches={fissureWatches}
         quantities={quantities}
         catalog={catalog}
         sectionOrder={sectionOrder}
@@ -319,8 +335,10 @@ export default function App() {
   // ── Modular Window state ───────────────────────────────────────────────────
   const [tracked, setTracked] = useState<string[]>([]);
   const [favorites, setFavorites] = useState<string[]>([]);
+  const [timerFavorites, setTimerFavorites] = useState<string[]>([]);
+  const [fissureWatches, setFissureWatches] = useState<FissureWatch[]>([]);
   const [modularWidth, setModularWidth] = useState(240);
-  const [modularSectionOrder, setModularSectionOrder] = useState<string[]>(["tracking", "favorites"]);
+  const [modularSectionOrder, setModularSectionOrder] = useState<string[]>(["tracking", "favorites", "timers", "fissures"]);
   const [modularPopout, setModularPopout] = useState(false);
   const modularWinRef = useRef<WebviewWindow | null>(null);
   const modularWinGeomRef = useRef<{ x?: number; y?: number; w?: number; h?: number }>({});
@@ -330,10 +348,10 @@ export default function App() {
   const settingsLoadedRef = useRef(false);
   const settingsRef = useRef({
     overlayEnabled: true, overlayPriority: "completion", textScale: 1, colorblindMode: false,
-    tracked: [] as string[], favorites: [] as string[], modularWidth: 240,
-    modularSectionOrder: ["tracking", "favorites"] as string[], modularPopout: false,
+    tracked: [] as string[], favorites: [] as string[], timerFavorites: [] as string[], fissureWatches: [] as FissureWatch[], modularWidth: 240,
+    modularSectionOrder: ["tracking", "favorites", "timers"] as string[], modularPopout: false,
   });
-  settingsRef.current = { overlayEnabled, overlayPriority, textScale, colorblindMode, tracked, favorites, modularWidth, modularSectionOrder, modularPopout };
+  settingsRef.current = { overlayEnabled, overlayPriority, textScale, colorblindMode, tracked, favorites, timerFavorites, fissureWatches, modularWidth, modularSectionOrder, modularPopout };
 
   const saveAllSettings = useCallback(() => {
     invoke("save_settings", { json: JSON.stringify(settingsRef.current) }).catch(() => {});
@@ -374,8 +392,15 @@ export default function App() {
         }
         if (Array.isArray(s.tracked)) setTracked(s.tracked);
         if (Array.isArray(s.favorites)) setFavorites(s.favorites);
+        if (Array.isArray(s.timerFavorites)) setTimerFavorites(s.timerFavorites);
+        if (Array.isArray(s.fissureWatches)) setFissureWatches(s.fissureWatches);
         if (typeof s.modularWidth === "number") setModularWidth(s.modularWidth);
-        if (Array.isArray(s.modularSectionOrder)) setModularSectionOrder(s.modularSectionOrder);
+        if (Array.isArray(s.modularSectionOrder)) {
+          const order: string[] = s.modularSectionOrder;
+          if (!order.includes("timers"))   order.push("timers");
+          if (!order.includes("fissures")) order.push("fissures");
+          setModularSectionOrder(order);
+        }
         if (typeof s.modularPopout === "boolean") setModularPopout(s.modularPopout);
         if (typeof s.modularWinX === "number") modularWinGeomRef.current.x = s.modularWinX;
         if (typeof s.modularWinY === "number") modularWinGeomRef.current.y = s.modularWinY;
@@ -1416,7 +1441,7 @@ export default function App() {
             onClick={() => setActiveModule("market")}
             title="Market Helper"
           >
-            <span className="module-icon">💰</span>
+            <img src="/market-icon.png" alt="" style={{ width: 24, height: 24, objectFit: "contain" }} />
             <span className="module-label">Market</span>
           </button>
           <button
@@ -1426,6 +1451,14 @@ export default function App() {
           >
             <img src="/relic-icon.png" alt="" style={{ width: 24, height: 24, objectFit: "contain" }} />
             <span className="module-label">Relics</span>
+          </button>
+          <button
+            className={`module-btn ${activeModule === "timers" ? "module-active" : ""}`}
+            onClick={() => setActiveModule("timers")}
+            title="Timers"
+          >
+            <img src="/timers-icon.png" alt="" style={{ width: 24, height: 24, objectFit: "contain" }} />
+            <span className="module-label">Timers</span>
           </button>
         </nav>
 
@@ -1640,6 +1673,21 @@ export default function App() {
           </ErrorBoundary>
         )}
 
+        {/* ── Timers module ── */}
+        {activeModule === "timers" && (
+          <ErrorBoundary>
+            <TimerHelper
+              favorites={timerFavorites}
+              onFavoriteToggle={id => setTimerFavorites(prev =>
+                prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]
+              )}
+              fissureWatches={fissureWatches}
+              onAddWatch={w => setFissureWatches(prev => [...prev, w])}
+              onRemoveWatch={id => setFissureWatches(prev => prev.filter(w => w.id !== id))}
+            />
+          </ErrorBoundary>
+        )}
+
         {/* ── Modular Window — always visible unless popped out ── */}
         {!modularPopout && <ModularWindow
           tracked={tracked}
@@ -1648,6 +1696,10 @@ export default function App() {
           favorites={favorites}
           onFavoritesChange={setFavorites}
           onUnfavorite={toggleFavorite}
+          timerFavorites={timerFavorites}
+          onTimerFavoritesChange={setTimerFavorites}
+          onTimerUnfavorite={id => setTimerFavorites(prev => prev.filter(x => x !== id))}
+          fissureWatches={fissureWatches}
           quantities={mergedQty}
           catalog={catalog}
           width={modularWidth}
