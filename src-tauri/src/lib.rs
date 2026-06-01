@@ -2836,8 +2836,18 @@ fn parse_worldstate_value(raw: &serde_json::Value, now_ms: i64, catalog: &std::c
             let manifest: Vec<Value> = t["Manifest"].as_array().map(|arr| arr.iter().map(|item| {
                 let raw_path = item["ItemType"].as_str().unwrap_or("");
                 let name = item_display_name(raw_path, catalog);
-                let aya = item["PrimePrice"].as_i64().unwrap_or(0);
-                json!({ "name": name, "uniqueName": store_to_unique(raw_path), "ayaPrice": aya })
+                let price = item["PrimePrice"].as_i64().unwrap_or(0);
+                // Regal Aya = bundle packs under MegaPrimeVault/; Aya = direct item paths
+                let is_regal = raw_path.contains("/MegaPrimeVault/");
+                let mut obj = serde_json::Map::new();
+                obj.insert("name".into(), json!(name));
+                obj.insert("uniqueName".into(), json!(store_to_unique(raw_path)));
+                if is_regal {
+                    obj.insert("regalAyaPrice".into(), json!(price));
+                } else {
+                    obj.insert("ayaPrice".into(), json!(price));
+                }
+                serde_json::Value::Object(obj)
             }).collect()).unwrap_or_default();
             json!({
                 "activation": ms_to_iso(activation_ms),

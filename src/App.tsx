@@ -285,6 +285,7 @@ export default function App() {
   const [masteryData, setMasteryData] = useState<Record<string, number>>({});
   const [wfConnected, setWfConnected] = useState(false);
   const [companionApiEnabled, setCompanionApiEnabled] = useState(false);
+  const [memoryScannerEnabled, setMemoryScannerEnabled] = useState(false);
   const [overlayStatus, setOverlayStatus] = useState("");
   const [subsummedWarframes, setSubsummedWarframes] = useState<Set<string>>(new Set());
   const [archonShards, setArchonShards] = useState<Record<string, {type: string; tauforged: boolean; color: string; boost?: string}[]>>({});
@@ -349,15 +350,24 @@ export default function App() {
   // Refs so we can read the latest state in the save callback without stale closures
   const settingsLoadedRef = useRef(false);
   const settingsRef = useRef({
-    overlayEnabled: true, overlayPriority: "completion", textScale: 1, colorblindMode: false, companionApiEnabled: false,
+    overlayEnabled: true, overlayPriority: "completion", textScale: 1, colorblindMode: false, companionApiEnabled: false, memoryScannerEnabled: false,
     tracked: [] as string[], favorites: [] as string[], timerFavorites: [] as string[], fissureWatches: [] as FissureWatch[], modularWidth: 240,
     modularSectionOrder: ["tracking", "favorites", "timers"] as string[], modularPopout: false,
   });
-  settingsRef.current = { overlayEnabled, overlayPriority, textScale, colorblindMode, companionApiEnabled, tracked, favorites, timerFavorites, fissureWatches, modularWidth, modularSectionOrder, modularPopout };
+  settingsRef.current = { overlayEnabled, overlayPriority, textScale, colorblindMode, companionApiEnabled, memoryScannerEnabled, tracked, favorites, timerFavorites, fissureWatches, modularWidth, modularSectionOrder, modularPopout };
 
   const saveAllSettings = useCallback(() => {
     invoke("save_settings", { json: JSON.stringify(settingsRef.current) }).catch(() => {});
   }, []); // eslint-disable-line
+
+  // ── Memory scanner toggle ─────────────────────────────────────────────────
+  useEffect(() => {
+    if (memoryScannerEnabled) {
+      invoke("start_monitor").then(() => setMonitoring(true)).catch(() => {});
+    } else {
+      invoke("stop_monitor").then(() => setMonitoring(false)).catch(() => {});
+    }
+  }, [memoryScannerEnabled]); // eslint-disable-line
 
   // ── WFM auto-login at app start ───────────────────────────────────────────
   // Restores the session into Rust's AppState so the Trading tab is instantly
@@ -388,6 +398,7 @@ export default function App() {
       try {
         const s = JSON.parse(json);
         if (typeof s.companionApiEnabled === "boolean") setCompanionApiEnabled(s.companionApiEnabled);
+        if (typeof s.memoryScannerEnabled === "boolean") setMemoryScannerEnabled(s.memoryScannerEnabled);
         if (typeof s.overlayEnabled === "boolean") {
           setOverlayEnabled(s.overlayEnabled);
           localStorage.setItem("ff-overlay-enabled", String(s.overlayEnabled));
@@ -457,10 +468,11 @@ export default function App() {
         .catch(() => {});
     }).catch(() => {});
 
-    // Auto-start monitor on launch so scanning begins immediately
+    // Auto-start monitor on launch — only if memory scanner is explicitly enabled
     invoke<boolean>("get_monitor_status").then(active => {
       if (!active) {
-        invoke("start_monitor").then(() => setMonitoring(true)).catch(() => {});
+        // memoryScannerEnabled not yet loaded from settings at this point;
+        // the effect below handles delayed auto-start after settings load.
       } else {
         setMonitoring(true);
       }
@@ -1105,6 +1117,13 @@ export default function App() {
             className={`wf-dot ${warframeRunning ? "wf-on" : "wf-off"}`}
             title={warframeRunning ? "Warframe detected" : "Warframe not running"}
           />
+          {!memoryScannerEnabled && (
+            <span style={{ fontSize: 10, color: "#f0c040", background: "rgba(240,192,64,.1)", border: "1px solid rgba(240,192,64,.3)", borderRadius: 3, padding: "1px 7px", cursor: "pointer" }}
+              title="Memory Scanner is disabled. Enable it in Settings to track inventory."
+              onClick={() => setShowSettings(true)}>
+              Scanner off
+            </span>
+          )}
           {overlayStatus && (
             <span style={{ fontSize: 11, color: '#9ecaed', marginLeft: 6,
               background: 'rgba(100,160,220,0.12)', padding: '2px 6px',
@@ -1136,7 +1155,9 @@ export default function App() {
           )}
           <button
             className={`btn-monitor ${monitoring ? "active" : ""}`}
-            onClick={toggleMonitor}
+            onClick={memoryScannerEnabled ? toggleMonitor : undefined}
+            disabled={!memoryScannerEnabled}
+            title={!memoryScannerEnabled ? "Enable Memory Scanner in Settings first" : undefined}
           >
             {monitoring ? "⏹ Stop" : "▶ Start monitor"}
           </button>
@@ -1269,6 +1290,40 @@ export default function App() {
                       settingsRef.current = { ...settingsRef.current, textScale: v };
                       saveAllSettings();
                     }} />
+                </div>
+              </div>
+
+              {/* ── Memory scanner toggle ── */}
+              <div className="settings-section" style={{ borderColor: memoryScannerEnabled ? "rgba(240,192,64,.3)" : undefined }}>
+                <div className="settings-section-title" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  Memory Scanner
+                  <span style={{ fontSize: 10, background: "rgba(240,192,64,.15)", color: "#f0c040", border: "1px solid rgba(240,192,64,.35)", borderRadius: 3, padding: "1px 6px", fontWeight: 700 }}>
+                    EULA GREY AREA
+                  </span>
+                </div>
+                <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 10, lineHeight: 1.6 }}>
+                  Uses the Windows <code style={{ fontSize: 10 }}>ReadProcessMemory</code> API to read your live inventory,
+                  crafting jobs, and mod ranks directly from the Warframe process.
+                  DE's EULA broadly prohibits <em>"automation programs that interact with the Services in any way"</em> —
+                  this may technically fall under that clause. DE has historically tolerated read-only tools,
+                  but has not given explicit permission.
+                </div>
+                <div style={{ background: "rgba(240,192,64,.07)", border: "1px solid rgba(240,192,64,.25)", borderRadius: 5, padding: "8px 10px", marginBottom: 10, fontSize: 11, color: "#f0c040", lineHeight: 1.5 }}>
+                  ⚠ Enabling this is at your own risk. We are awaiting official clarification from Digital Extremes.
+                  The app works without it — Foundry, Market Helper, Relic Helper, Timers, and Trading all function fully.
+                </div>
+                <div className="settings-row">
+                  <div>
+                    <span className="settings-row-label">Enable Memory Scanner</span>
+                    <span className="settings-row-desc">Required for live inventory, quantity tracking, and mod ranks</span>
+                  </div>
+                  <button
+                    className="btn-secondary"
+                    style={{ minWidth: 64, background: memoryScannerEnabled ? "rgba(240,192,64,.15)" : undefined, borderColor: memoryScannerEnabled ? "#f0c040" : undefined, color: memoryScannerEnabled ? "#f0c040" : undefined }}
+                    onClick={() => { const next = !memoryScannerEnabled; setMemoryScannerEnabled(next); saveAllSettings(); }}
+                  >
+                    {memoryScannerEnabled ? "Enabled" : "Disabled"}
+                  </button>
                 </div>
               </div>
 

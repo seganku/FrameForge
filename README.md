@@ -1,4 +1,4 @@
-# FrameForge — Warframe Companion `v1.4.1`
+# FrameForge — Warframe Companion `v1.4.2`
 
 A desktop companion for Warframe that shows your live inventory, tracks crafting recipes, displays market prices, runs a full trading desk, manages a live timer dashboard, and auto-detects relic reward screens — all without modifying the game.
 
@@ -46,6 +46,17 @@ A live dashboard fetching data directly from DE's official Warframe worldstate:
 - **Fissure Watches** — configure Mode + Tier + Mission Type filters; matching fissures are highlighted in the fissure list and auto-surfaced in the Modular Window
 
 Any timer can be pinned to the Modular Window for at-a-glance viewing.
+
+### EULA Transparency — Both Sensitive Features Are Off By Default
+
+FrameForge places every feature that may touch Digital Extremes' EULA grey areas behind an explicit opt-in toggle, **disabled by default**:
+
+- **Memory Scanner** (`Settings → Memory Scanner`) — uses `ReadProcessMemory` to read live inventory data. DE's EULA broadly prohibits *"automation programs that interact with the Services in any way"*; read-only memory tools have historically been tolerated but are not explicitly permitted. Required for the Inventory tab and quantity tracking.
+- **Warframe Companion API** (`Settings → Warframe Companion API`) — connects to `api.warframe.com/api/inventory.php` for mod ranks and additional inventory detail. Not officially confirmed as permitted for third-party tools.
+
+Both show a clear warning before the user can enable them. The app works fully without either — Foundry, Market Helper, Relic Helper, Timers, and Statistics all function using only public data sources and local files.
+
+We are actively seeking official clarification from Digital Extremes. If DE confirms either feature is not permitted, it will be removed in the next release.
 
 ### Warframe Companion API — Optional & Opt-In
 The connection to `api.warframe.com/api/inventory.php` (which adds mod ranks and detailed inventory data) is **disabled by default**. It can be enabled in Settings under "Warframe Companion API" with a clear warning. We are awaiting official clarification from Digital Extremes on whether this endpoint is permitted for community tools. The app works fully without it — all core features use the read-only memory scanner only.

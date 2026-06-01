@@ -14,7 +14,7 @@ interface WsSortieVariant { missionType: string; modifier: string; node: string;
 interface WsSortie   { expiry: string; boss: string; faction: string; variants: WsSortieVariant[]; active: boolean; }
 interface WsMission  { type: string; node: string; }
 interface WsArchon   { expiry: string; boss: string; faction: string; missions: WsMission[]; active: boolean; }
-interface WsManifestItem { name: string; uniqueName?: string; primePrice?: number; regularPrice?: number; ayaPrice?: number; }
+interface WsManifestItem { name: string; uniqueName?: string; primePrice?: number; regularPrice?: number; ayaPrice?: number; regalAyaPrice?: number; }
 interface WsTrader   { expiry: string; activation: string; character: string; location: string; active: boolean; manifest: WsManifestItem[]; }
 interface WsPrimeResurgence { expiry: string; activation: string; active: boolean; manifest: WsManifestItem[]; }
 interface WsNight    { expiry: string; season: number; active: boolean; }
@@ -424,6 +424,7 @@ export default function TimerHelper({ favorites, onFavoriteToggle, fissureWatche
                     <div key={i} className={`timer-inv-row${owned ? " inv-owned" : ""}`}>
                       <span className="timer-inv-name">{item.name}</span>
                       {owned && <span className="inv-owned-tag">Owned</span>}
+                      {item.regalAyaPrice ? <span className="timer-inv-price aya" style={{ color: "#c084fc" }}>{item.regalAyaPrice} <span className="inv-currency">Regal Aya</span></span> : null}
                       {item.ayaPrice ? <span className="timer-inv-price aya">{item.ayaPrice} <span className="inv-currency">Aya</span></span> : null}
                     </div>
                   );

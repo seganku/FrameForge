@@ -411,7 +411,7 @@ export default function ModularWindow({
         if (matched.length === 0) {
           return <div className="modular-empty">No matching fissures active.</div>;
         }
-        const variantLabel: Record<string, string> = { normal: "N", hard: "SP", storm: "Storm" };
+        const variantLabel: Record<string, string> = { normal: "Normal", hard: "Steel Path", storm: "Storm" };
         return (
           <div className="modular-fav-list">
             {matched.map(({ f, variant }, i) => {
