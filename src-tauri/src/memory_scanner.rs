@@ -403,7 +403,7 @@ fn scan_mastery_rank(data: &[u8]) -> Option<u32> {
 // ─── Main scan entry point ────────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
-pub fn scan_warframe_memory(unique_names: &[String], display_names: &[String]) -> ScanResult {
+pub fn scan_warframe_memory(unique_names: &[String], display_names: &[String], assembled_names: &[String]) -> ScanResult {
     use std::ffi::c_void;
     use std::mem;
     use windows_sys::Win32::{
@@ -428,11 +428,13 @@ pub fn scan_warframe_memory(unique_names: &[String], display_names: &[String]) -
         .map(|(u, d)| (u.clone(), d.clone()))
         .collect();
 
-    // Unique-item paths: owned via ItemId/Configs, never have ItemCount in inventory
-    // Unique items: owned via ItemId+Configs, never have ItemCount in inventory.
+    // Unique-item paths: assembled items owned via ItemId+Configs in the inventory JSON.
+    // assembled_names is pre-filtered in lib.rs using fix_category so that component parts
+    // sharing a /Lotus/Weapons/ path prefix (e.g. "Paris Prime String") are NOT included
+    // here — those parts have ItemCount and must be processed by Scanner 1, not skipped.
     // NOTE: /Lotus/Types/Recipes/ is intentionally excluded — recipe blueprints
     // are stackable resources with ItemCount, handled by scanner 1, not here.
-    let unique_item_paths: Vec<String> = unique_names.iter()
+    let unique_item_paths: Vec<String> = assembled_names.iter()
         .filter(|p| {
             p.starts_with("/Lotus/Powersuits/")
                 || p.starts_with("/Lotus/Weapons/")
@@ -444,10 +446,6 @@ pub fn scan_warframe_memory(unique_names: &[String], display_names: &[String]) -
                 || p.starts_with("/Lotus/Types/Game/KubrowPet/")
         })
         .cloned()
-        .collect();
-
-    let unique_item_idx: Vec<usize> = unique_item_paths.iter()
-        .map(|p| unique_names.iter().position(|u| u == p).unwrap())
         .collect();
 
     // Set of paths handled by the unique scanner — resource scanner skips exactly these
@@ -483,10 +481,9 @@ pub fn scan_warframe_memory(unique_names: &[String], display_names: &[String]) -
         },
     };
 
-    let mut resources:       HashMap<String, i64>          = HashMap::new();
-    let mut unique:          HashMap<usize, usize>         = HashMap::new();
-    // mastery_data: catalog_idx → max rank seen across all regions
-    let mut mastery_data:    HashMap<usize, u32>           = HashMap::new();
+    let mut resources:    HashMap<String, i64>   = HashMap::new();
+    let mut unique:       HashMap<String, usize> = HashMap::new(); // path → best region hit-count
+    let mut mastery_data: HashMap<String, u32>   = HashMap::new(); // path → max rank seen
     let mut pending_recipes: Vec<PendingRecipe>            = Vec::new();
     let mut mastery_rank:    Option<u32>                   = None;
     let mut regions_scanned = 0usize;
@@ -537,8 +534,14 @@ pub fn scan_warframe_memory(unique_names: &[String], display_names: &[String]) -
             let base = mbi.BaseAddress as usize;
 
             // ── Scanner 1: Resources ──────────────────────────────────────────
-            // Only run on small regions — inventory blobs are always ≤ 512 KB
-            if bytes_read <= 512 * 1024 {
+            // Quick marker check before the full scan: only process regions that
+            // actually contain inventory JSON. Veteran players can have inventories
+            // several MB in size (thousands of mods, relics, resources); the old
+            // 512 KB cap silently missed those larger blobs entirely.
+            // Unrelated large regions (code, graphics, audio) won't contain
+            // "ItemCount": and are skipped cheaply by this check.
+            let has_inventory = data.windows(13).any(|w| w == b"\"ItemCount\":");
+            if has_inventory {
                 let res_pairs = scan_inventory_resources(data, &unique_path_set);
                 if !res_pairs.is_empty() {
                     let preview: String = res_pairs.iter().take(5)
@@ -558,8 +561,8 @@ pub fn scan_warframe_memory(unique_names: &[String], display_names: &[String]) -
                 }
             }
 
-            // ── Mastery rank — only scan small regions ────────────────────────
-            if mastery_rank.is_none() && bytes_read <= 512 * 1024 {
+            // ── Mastery rank — same marker check as Scanner 1 ─────────────────
+            if mastery_rank.is_none() && has_inventory {
                 mastery_rank = scan_mastery_rank(data);
             }
 
@@ -589,11 +592,11 @@ pub fn scan_warframe_memory(unique_names: &[String], display_names: &[String]) -
                 ));
                 let n = unique_hits.len();
                 for &(local_idx, rank) in &unique_hits {
-                    let catalog_idx = unique_item_idx[local_idx];
-                    let entry = unique.entry(catalog_idx).or_insert(n);
+                    let path = unique_item_paths[local_idx].clone();
+                    let entry = unique.entry(path.clone()).or_insert(n);
                     if n > *entry { *entry = n; }
                     if let Some(r) = rank {
-                        let mr = mastery_data.entry(catalog_idx).or_insert(0);
+                        let mr = mastery_data.entry(path).or_insert(0);
                         if r > *mr { *mr = r; }
                     }
                 }
@@ -618,13 +621,10 @@ pub fn scan_warframe_memory(unique_names: &[String], display_names: &[String]) -
         }
     }
 
-    // Build mastery_data map: unique_name → rank
-    let mastery_data_out: HashMap<String, u32> = mastery_data.iter()
-        .map(|(idx, rank)| (unique_names[*idx].clone(), *rank))
-        .collect();
+    // mastery_data is already path-keyed — use it directly.
+    let mastery_data_out = mastery_data;
 
-    for (catalog_idx, _n) in &unique {
-        let path = &unique_names[*catalog_idx];
+    for (path, _n) in &unique {
         if resources.contains_key(path) { continue; }
         if let Some(name) = display_map.get(path) {
             items_found.push(FoundItem {

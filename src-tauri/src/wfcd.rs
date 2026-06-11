@@ -656,7 +656,9 @@ fn fetch_from_wfcd() -> Result<FetchResult, String> {
                         || cunique.starts_with("/Lotus/Weapons/")
                         || cunique.starts_with("/Lotus/Companions/")
                         || cunique.starts_with("/Lotus/Sentinels/")
+                        || cunique.starts_with("/Lotus/Types/Sentinels/") // SentinelParts crafted components
                         || cunique.starts_with("/Lotus/Archwing/")
+                        || cunique.starts_with("/Lotus/Types/Game/") // Kubrow/Kavat pet parts
                         || cname.contains("Blueprint");
                     if !is_part { continue; }
 
@@ -679,12 +681,15 @@ fn fetch_from_wfcd() -> Result<FetchResult, String> {
                         let raw_comp_name = if cunique.starts_with("/Lotus/Powersuits/")
                             || cunique.starts_with("/Lotus/Companions/")
                             || cunique.starts_with("/Lotus/Sentinels/")
+                            || cunique.starts_with("/Lotus/Types/Sentinels/")
+                            || cunique.starts_with("/Lotus/Types/Game/")
                             || cunique.starts_with("/Lotus/Archwing/")
                         {
-                            // These paths are the BUILT part, not the blueprint.
+                            // These paths are BUILT parts (not blueprints).
                             // WFCD sometimes names them "Chassis Blueprint" already —
                             // strip the " Blueprint" suffix so the built part gets the
-                            // correct name and Strategy A can create a distinct blueprint entry.
+                            // correct name and ExportRecipes can provide a distinct blueprint entry.
+                            // Also guard against WFCD including the parent name in the component name.
                             let base = cname.strip_suffix(" Blueprint").unwrap_or(cname);
                             if base.starts_with(&*name) { base.to_string() }
                             else { format!("{} {}", name, base) }
@@ -776,9 +781,14 @@ fn fetch_from_wfcd() -> Result<FetchResult, String> {
         // so Strategy B doesn't create a duplicate synthetic blueprint for the same item.
         let mut handled_by_a: HashSet<String> = HashSet::new();
 
-        // Strategy A: ExportRecipes
+        // Strategy A: ExportRecipes — covers warframe components, sentinel parts, archwing
+        // components, and any other intermediate craftable items.
         for (result_type, recipe) in &export_recipes {
-            if !result_type.starts_with("/Lotus/Powersuits/") { continue; }
+            // Only process result paths that are tracked owned-item prefixes.
+            let is_tracked = result_type.starts_with("/Lotus/Powersuits/")
+                || result_type.starts_with("/Lotus/Types/Sentinels/SentinelParts/")
+                || result_type.starts_with("/Lotus/Archwing/");
+            if !is_tracked { continue; }
             let bp_unique = &recipe.blueprint_unique;
 
             // Always mark the result_type as handled so Strategy B never creates a
@@ -856,22 +866,19 @@ fn fetch_from_wfcd() -> Result<FetchResult, String> {
         }
 
         // Debug: write counts to temp file so we can diagnose issues
-        let powersuits_in_recipes = export_recipes.keys()
-            .filter(|k| k.starts_with("/Lotus/Powersuits/")).count();
+        let sentinel_in_recipes = export_recipes.keys()
+            .filter(|k| k.starts_with("/Lotus/Types/Sentinels/SentinelParts/")).count();
         let _ = std::fs::write(
             std::env::temp_dir().join("frameforge_wfcd_debug.txt"),
             format!(
-                "export_recipes total={} powersuits_entries={}\n\
-                 strategy_a candidates checked={}\n\
-                 strategy_b items scanned={}\n\
-                 total bp_items added={}\n\
-                 first 5 bp items:\n{}",
+                "export_recipes total={} powersuits_entries={} sentinel_parts_entries={}\n\
+                 strategy_a bp_items added={}\n\
+                 first 10 bp items:\n{}",
                 export_recipes.len(),
-                powersuits_in_recipes,
-                export_recipes.iter().filter(|(k,_)| k.starts_with("/Lotus/Powersuits/")).count(),
-                items.iter().filter(|i| i.unique_name.starts_with("/Lotus/Powersuits/")).count(),
+                export_recipes.keys().filter(|k| k.starts_with("/Lotus/Powersuits/")).count(),
+                sentinel_in_recipes,
                 bp_items.len(),
-                bp_items.iter().take(5).map(|i| format!("  {} = {}", i.unique_name, i.name)).collect::<Vec<_>>().join("\n")
+                bp_items.iter().take(10).map(|i| format!("  {} = {}", i.unique_name, i.name)).collect::<Vec<_>>().join("\n")
             )
         );
 

@@ -592,14 +592,25 @@ fn word_found_in_set(
     for ocr_w in ocr_words {
         // Full-word Levenshtein — reject pure prefix/suffix insertions (len_diff == dist && >= 2)
         // e.g. dist("akbronco","bronco")=2 with len_diff=2 is just "ak" prepended, not a typo.
-        let dist = lev_dist(catalog_word, ocr_w);
-        let len_diff = (catalog_word.len() as isize - ocr_w.len() as isize).unsigned_abs();
-        if dist <= max_dist && !(len_diff == dist && len_diff >= 2) { return true; }
-        // Sliding window (merged tokens)
+        // Also require OCR word ≥4 chars: 3-char HUD noise ("RAM","FPS","GPU") must not
+        // fuzzy-match 4-char catalog words ("gram","fang"…) regardless of screen position.
+        if ocr_w.len() >= 4 {
+            let dist = lev_dist(catalog_word, ocr_w);
+            let len_diff = (catalog_word.len() as isize - ocr_w.len() as isize).unsigned_abs();
+            if dist <= max_dist && !(len_diff == dist && len_diff >= 2) { return true; }
+        }
+        // Sliding window (merged tokens — e.g. OCR reads "SevagothPrime" as one word)
         let ob = ocr_w.as_bytes();
         if ob.len() >= wb.len() {
-            for win in ob.windows(wb.len()) {
+            for (win_start, win) in ob.windows(wb.len()).enumerate() {
                 let errs = wb.iter().zip(win.iter()).filter(|(a, b)| a != b).count();
+                // Guard: reject exact suffix matches where the catalog word cleanly
+                // terminates a longer OCR word (e.g. "fang" ending "sarofang").
+                // "Sarofang" is a single correctly-read word; "fang" appearing at its
+                // tail is a lexical coincidence, not an OCR merge artifact.
+                // Only guard exact matches (errs == 0) — fuzzy matches are always valid.
+                // win_start >= 3 avoids blocking short prefixes like "ak" in "akbronco".
+                if errs == 0 && win_start + wb.len() == ob.len() && win_start >= 3 { continue; }
                 if errs <= max_dist { return true; }
             }
         }
@@ -1193,11 +1204,11 @@ pub fn extract_reward_items_twophase(
     //   centroid:       0.50-0.41=0.09 < 0.10 (extend, center→0.455), 0.59-0.455=0.135 > 0.10 → 2 clusters
     let ocr_cluster_count: usize = {
         // Filter to lines that are (a) long enough to be item text and
-        // (b) NOT in the top 8% of the capture.  FPS counters, GPU widgets and
-        // other screen-edge HUD overlays sit at y < 0.08 and would otherwise
-        // create a spurious extra x-cluster, inflating the card count.
+        // (b) NOT in the top 10% of the capture. The reward cards never appear
+        // there — only the game title bar and screen-edge HUD overlays (FPS
+        // counters, GPU widgets) do. Excluding them prevents spurious x-clusters.
         let mut xs: Vec<f32> = ocr_lines.iter()
-            .filter(|(t, _, y)| t.trim().len() >= 3 && *y >= 0.08)
+            .filter(|(t, _, y)| t.trim().len() >= 3 && *y >= 0.10)
             .map(|(_, x, _)| *x)
             .collect();
         xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -1247,7 +1258,8 @@ pub fn extract_reward_items_twophase(
     let columns: Vec<(Vec<String>, f32)> = {
         let mut cols: Vec<(Vec<String>, f32)> =
             active_centers.iter().map(|&cx| (Vec::new(), cx)).collect();
-        for (text, x, _) in &ocr_lines {
+        for (text, x, y) in &ocr_lines {
+            if *y < 0.10 { continue; } // exclude top-of-screen HUD overlays and the game's own title bar
             let idx = active_centers.iter().enumerate()
                 .min_by(|(_, a), (_, b)| {
                     (x - *a).abs().partial_cmp(&(x - *b).abs())
@@ -1365,9 +1377,11 @@ pub fn extract_reward_items_twophase(
             col_idx, cx, best_score, best_display, col_preview
         ));
 
-        // Require 0.75 for per-column: prevents weak matches (score≈0.67)
-        // caused by common words ("prime","blueprint") leaking from adjacent cards.
-        if best_score < 0.75 { continue; }
+        // Require 0.67 for per-column. Items where only "prime"+"blueprint" match
+        // score exactly 0.667 (still rejected). A specific word matched via suffix
+        // or Levenshtein + one generic word scores ≥0.69 and is now accepted,
+        // preventing the fallback which can cross-contaminate words from other columns.
+        if best_score < 0.67 { continue; }
         let unique = match best_unique { Some(u) => u, None => continue };
         // No dedup here — each column is a distinct physical card.
         // Two players cracking the same relic legitimately show the same reward twice.
@@ -1395,7 +1409,10 @@ pub fn extract_reward_items_twophase(
 
     if items.len() < estimated_cards {
         let all_words = build_word_set(
-            &raw_full.lines().map(|l| l.to_string()).collect::<Vec<_>>()
+            &ocr_lines.iter()
+                .filter(|(_, _, y)| *y >= 0.10)
+                .map(|(t, _, _)| t.clone())
+                .collect::<Vec<_>>()
         );
 
         // Words that appear in almost every reward and carry no item-specific

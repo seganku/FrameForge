@@ -26,6 +26,7 @@ interface Props {
   apiQuantities: Record<string, number>;
   refreshKey: number;
   crafting: CraftingJob[];
+  onWfmLoginChange?: (loggedIn: boolean) => void;
 }
 
 // ─── Icons ────────────────────────────────────────────────────────────────────
@@ -151,7 +152,7 @@ function SetCard({ setKey, parts, parentItem, setPrice, setPriceLoading, pricesF
 
 type SortMode = "name" | "ducats-owned" | "ducats-all" | "completion";
 
-export default function MarketHelper({ quantities, apiQuantities, refreshKey, crafting }: Props) {
+export default function MarketHelper({ quantities, apiQuantities, refreshKey, crafting, onWfmLoginChange }: Props) {
   const [allItems, setAllItems]         = useState<CatalogItem[]>([]);
   const [wfmItems, setWfmItems]         = useState<WfmItem[]>([]);
   const [wfmLoading, setWfmLoading]     = useState(false);
@@ -185,6 +186,11 @@ export default function MarketHelper({ quantities, apiQuantities, refreshKey, cr
       .then(existing => { if (existing) setWfmUsername(existing[0]); })
       .catch(() => {});
   }, []); // eslint-disable-line
+
+  // Propagate login state to parent
+  useEffect(() => {
+    onWfmLoginChange?.(!!wfmUsername);
+  }, [wfmUsername]); // eslint-disable-line
 
   // Load cached prices from localStorage on startup
   useEffect(() => {

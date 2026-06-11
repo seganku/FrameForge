@@ -1,4 +1,8 @@
+<<<<<<< HEAD
 # FrameForge — Warframe Companion `v1.7.0`
+=======
+# FrameForge — Warframe Companion `v1.8.0`
+>>>>>>> 8572a56 (Release v1.8.0)
 
 A desktop companion for Warframe that shows your live inventory, tracks crafting recipes, displays market prices, runs a full trading desk, manages a live timer dashboard, auto-detects relic reward screens, and analyses riven mods — all without modifying the game.
 
@@ -9,7 +13,7 @@ A desktop companion for Warframe that shows your live inventory, tracks crafting
 ## Features
 
 ### Live Inventory Scanning
-Your inventory is read directly from the Warframe process memory every 10 seconds across 13 item categories — resources, mods, arcanes, relics, weapons, Warframes, companions, and more. No login required. The scanner is **strictly read-only**: it uses `ReadProcessMemory`, the same Windows API used by Overwolf and hardware monitors. It never writes to memory, injects code, or modifies the game.
+Your inventory is read directly from the Warframe process memory every 10 seconds across 13 item categories — resources, mods, arcanes, relics, weapons, Warframes, companions, warframe blueprints, weapon component blueprints, crafted warframe parts, and more. No login required. The scanner is **strictly read-only**: it uses `ReadProcessMemory`, the same Windows API used by Overwolf and hardware monitors. It never writes to memory, injects code, or modifies the game.
 
 A quantity change log records every item gain and loss with timestamps.
 
@@ -58,8 +62,14 @@ Both show a clear warning before the user can enable them. The app works fully w
 
 We are actively seeking official clarification from Digital Extremes. If DE confirms either feature is not permitted, it will be removed in the next release.
 
-### Warframe Companion API — Optional & Opt-In
-The connection to `api.warframe.com/api/inventory.php` (which adds mod ranks and detailed inventory data) is **disabled by default**. It can be enabled in Settings under "Warframe Companion API" with a clear warning. We are awaiting official clarification from Digital Extremes on whether this endpoint is permitted for community tools. The app works fully without it — all core features use the read-only memory scanner only.
+### Status Bar
+The header shows three live connection chips so you always know what's running:
+
+| Chip | States |
+|---|---|
+| **Scanner** | OFF · Idle · No game · Active `HH:MM` (last scan time) |
+| **WF API** | OFF · Waiting · Connecting… (clickable retry) · Connected `HH:MM` |
+| **WFM** | Not logged in (clickable → Market tab) · Online |
 
 ### Statistics — Trade Tracker, Reports & Item History
 A full trade history, analytics dashboard, and per-item quantity tracking — all automatically populated from your activity:
@@ -99,6 +109,8 @@ A dedicated tab for analysing riven mod rolls against the community-curated Sike
 
 ### OCR Relic Reward Overlay
 When a void fissure reward screen opens in-game, FrameForge automatically captures and reads all four reward cards using Windows OCR and displays a transparent overlay with each item's platinum price, ducat value, and set completion — so you can pick the best reward instantly without alt-tabbing. Priority mode is configurable: Item Completion, Most Set Value, Most Plat, or Most Ducats.
+
+The top 10% of the capture is excluded from card detection — this prevents FPS counters, GPU overlays, and the game's own title bar from creating ghost card columns. Short HUD noise words (3 chars or fewer) are also filtered out from fuzzy matching so they cannot corrupt item name detection.
 
 ### Modular Window
 A customisable sidebar (or detachable floating window) with four reorderable sections:
@@ -182,9 +194,10 @@ WFM order management uses the v2 REST API (`api.warframe.market/v2/`). Authentic
 1. `EE.log` is monitored for `openvoidprojectionrewardscreen`
 2. After a 350 ms delay, the top 48% of the Warframe window is captured via `PrintWindow` (GDI) or DXGI Desktop Duplication
 3. Windows WinRT OCR extracts text from the capture
-4. Rarity bar colour analysis classifies each of the 4 reward slots
-5. Fuzzy string matching maps OCR output to catalog item names
-6. A transparent overlay displays each card's item name, price, ducat value, and set completion
+4. Lines in the top 10% of the capture are discarded — they are always game chrome or HUD overlays (FPS counters, GPU widgets), never reward card text
+5. Rarity bar colour analysis classifies each of the 4 reward slots
+6. Fuzzy string matching maps OCR output to catalog item names; words under 4 characters are excluded from fuzzy matching to prevent HUD noise matching short catalog words
+7. A transparent overlay displays each card's item name, price, ducat value, and set completion
 
 ### Item Data (`wfcd.rs`)
 Item and recipe data is fetched on first launch and cached to disk:

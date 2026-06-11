@@ -302,6 +302,8 @@ function RelicCard({ drop, catalogRelicByName, quantities, ownedPrimeNames, sear
             primeName ? `https://cdn.warframestat.us/img/${primeName.replace(/\s+/g, "")}.png` : undefined,
             // 5. Strip "Blueprint" from item name: "Forma Blueprint" → "Forma.png"
             `https://cdn.warframestat.us/img/${r.itemName.replace(" Blueprint", "").replace(/\s+/g, "")}.png`,
+            // 6. Strip leading count prefix: "2X Forma" → "Forma.png"
+            `https://cdn.warframestat.us/img/${r.itemName.replace(/^\d+[xX]\s*/, "").replace(" Blueprint", "").replace(/\s+/g, "")}.png`,
           ];
           // Gold: the complete parent prime item is built and in inventory
           // Gold: look up the parent prime item by name in the catalog, then check quantities

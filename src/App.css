@@ -35,13 +35,36 @@ html, body, #root { height: 100%; font-family: -apple-system, BlinkMacSystemFont
   background: rgba(192,160,96,.12); border: 1px solid rgba(192,160,96,.3);
   border-radius: 5px; padding: 2px 8px; flex-shrink: 0; letter-spacing: .03em;
 }
-.header-right  { display: flex; align-items: center; gap: 10px; margin-left: auto; }
-.scan-time { font-size: 11px; color: var(--muted); }
-.api-badge  { font-size: 11px; color: #3fb950; opacity: 0.85; }
+.header-right  { display: flex; align-items: center; gap: 6px; margin-left: auto; }
 
-.wf-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-.wf-on  { background: var(--green); box-shadow: 0 0 6px var(--green); }
-.wf-off { background: var(--muted); }
+/* Connection status chips */
+.conn-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11px; padding: 3px 8px; border-radius: 4px;
+  border: 1px solid var(--border); background: rgba(255,255,255,.03);
+  color: var(--muted); white-space: nowrap; user-select: none;
+}
+.conn-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; background: var(--muted); }
+.conn-label { font-weight: 500; color: var(--text); opacity: .7; }
+.conn-detail { color: var(--muted); }
+
+.conn-online  { border-color: rgba(63,185,80,.25); }
+.conn-online  .conn-dot { background: #3fb950; box-shadow: 0 0 5px #3fb95066; }
+.conn-online  .conn-detail { color: #3fb950; }
+
+.conn-warn    { border-color: rgba(210,153,34,.3); cursor: pointer; }
+.conn-warn    .conn-dot { background: #d29922; }
+.conn-warn    .conn-detail { color: #d29922; }
+
+.conn-offline .conn-dot { background: #6e7681; }
+
+.conn-disabled { opacity: .45; cursor: pointer; }
+.conn-disabled .conn-dot { background: #6e7681; }
+
+.conn-overlay { border-color: rgba(100,160,220,.25); }
+.conn-overlay .conn-dot { background: #9ecaed; animation: pulse-ocr 1.2s ease-in-out infinite; }
+.conn-overlay .conn-detail { color: #9ecaed; font-family: monospace; }
+@keyframes pulse-ocr { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
 
 .btn-monitor {
   padding: 5px 12px;

@@ -246,7 +246,9 @@ function ModularWindowPage() {
   }, []);
 
   const saveModularSettings = useCallback((patch: object) => {
-    invoke("save_settings", { json: JSON.stringify(patch) }).catch(() => {});
+    invoke("save_settings", { json: JSON.stringify(patch) }).catch((e) => {
+      console.error("save_settings failed:", e);
+    });
   }, []);
 
   useEffect(() => {
@@ -340,6 +342,7 @@ export default function App() {
   const [wfConnected, setWfConnected] = useState(false);
   const [companionApiEnabled, setCompanionApiEnabled] = useState(false);
   const [memoryScannerEnabled, setMemoryScannerEnabled] = useState(false);
+  const [wfmLoggedIn, setWfmLoggedIn] = useState(false);
   const [overlayStatus, setOverlayStatus] = useState("");
   const [subsummedWarframes, setSubsummedWarframes] = useState<Set<string>>(new Set());
   const [archonShards, setArchonShards] = useState<Record<string, {type: string; tauforged: boolean; color: string; boost?: string}[]>>({});
@@ -411,7 +414,9 @@ export default function App() {
   settingsRef.current = { overlayEnabled, overlayPriority, textScale, colorblindMode, companionApiEnabled, memoryScannerEnabled, tracked, favorites, timerFavorites, fissureWatches, modularWidth, modularSectionOrder, modularPopout };
 
   const saveAllSettings = useCallback(() => {
-    invoke("save_settings", { json: JSON.stringify(settingsRef.current) }).catch(() => {});
+    invoke("save_settings", { json: JSON.stringify(settingsRef.current) }).catch((e) => {
+      console.error("save_settings failed:", e);
+    });
   }, []); // eslint-disable-line
 
   // ── Memory scanner toggle ─────────────────────────────────────────────────
@@ -859,7 +864,7 @@ export default function App() {
 
   useEffect(() => {
     if (settingsLoadedRef.current) saveAllSettings();
-  }, [tracked, favorites, modularWidth, memoryScannerEnabled, companionApiEnabled, modularSectionOrder, modularPopout]); // eslint-disable-line
+  }, [tracked, favorites, timerFavorites, fissureWatches, modularWidth, memoryScannerEnabled, companionApiEnabled, modularSectionOrder, modularPopout]); // eslint-disable-line
 
   // ── Modular pop-out window ─────────────────────────────────────────────────
   useEffect(() => {
@@ -1148,14 +1153,11 @@ export default function App() {
   // ── Derived data ───────────────────────────────────────────────────────────
 
   const mergedQty = useMemo(() => {
-    // Strip blueprint paths from scanner data before merging.
-    // /Lotus/Types/Recipes/ paths appear in mission memory when items drop —
-    // they cannot be reliably distinguished from real inventory.
-    // The Warframe API's Recipes field is the authoritative source for blueprints.
-    const scannerFiltered = Object.fromEntries(
-      Object.entries(quantities).filter(([k]) => !k.includes("/Types/Recipes/"))
-    );
-    return { ...scannerFiltered, ...apiQuantities };
+    // Merge scanner quantities with API quantities (API wins on conflict).
+    // The stability buffer (2 consecutive scans) in the Rust scanner already
+    // filters out transient reads from mission reward screens, so we do not
+    // need to strip /Types/Recipes/ paths here.
+    return { ...quantities, ...apiQuantities };
   }, [quantities, apiQuantities]);
 
   const modCopiesMap = useMemo(() => {
@@ -1265,49 +1267,92 @@ export default function App() {
           <span className="mastery-badge" title="Mastery Rank">MR {masteryRank}</span>
         )}
         <div className="header-right">
-          {lastScan && (
-            <span className="scan-time">Last scan {timeStr(lastScan)}</span>
-          )}
-          <span
-            className={`wf-dot ${warframeRunning ? "wf-on" : "wf-off"}`}
-            title={warframeRunning ? "Warframe detected" : "Warframe not running"}
-          />
-          {!memoryScannerEnabled && (
-            <span style={{ fontSize: 10, color: "#f0c040", background: "rgba(240,192,64,.1)", border: "1px solid rgba(240,192,64,.3)", borderRadius: 3, padding: "1px 7px", cursor: "pointer" }}
-              title="Memory Scanner is disabled. Enable it in Settings to track inventory."
-              onClick={() => setShowSettings(true)}>
-              Scanner off
-            </span>
-          )}
-          {overlayStatus && (
-            <span style={{ fontSize: 11, color: '#9ecaed', marginLeft: 6,
-              background: 'rgba(100,160,220,0.12)', padding: '2px 6px',
-              borderRadius: 3, fontFamily: 'monospace' }}>
-              {overlayStatus}
-            </span>
-          )}
-          {wfConnected && lastApiRefresh && (
-            <span className="api-badge" title="Warframe API — auto-refreshes every 30s">⚡ API {timeStr(lastApiRefresh)}</span>
-          )}
-          {!wfConnected && warframeRunning && companionApiEnabled && (
-            <span
-              className="api-badge"
-              style={{ color: "var(--muted)", cursor: "pointer" }}
-              title="Click to retry credential scan now"
-              onClick={async () => {
-                try {
-                  const [accountId, nonce, steamId] = await invoke<[string, string, string]>("scan_warframe_credentials");
-                  const data = await invoke<any>("fetch_warframe_inventory", { accountId, nonce, steamId });
-                  applyInventoryData(data);
-                  setWfConnected(true);
-                  wfConnectedRef.current = true;
-                  manualCredsRef.current = { accountId, nonce };
-                } catch (e) {
-                  alert(`Credential scan failed:\n${e}\n\nMake sure you are in the Orbiter (not in a mission or loading screen).`);
+          {/* ── Connection status chips ── */}
+          {(() => {
+            // Scanner chip
+            const scanState: "online"|"warn"|"offline"|"disabled" =
+              !memoryScannerEnabled ? "disabled"
+              : !monitoring         ? "offline"
+              : warframeRunning     ? "online"
+              : "warn";
+            const scanDetail =
+              !memoryScannerEnabled ? "OFF"
+              : !monitoring         ? "Idle"
+              : warframeRunning && lastScan ? timeStr(lastScan)
+              : warframeRunning     ? "Active"
+              : "No game";
+
+            // WF API chip
+            const wfApiState: "online"|"warn"|"offline"|"disabled" =
+              !companionApiEnabled                    ? "disabled"
+              : wfConnected                           ? "online"
+              : warframeRunning                       ? "warn"
+              : "offline";
+            const wfApiDetail =
+              !companionApiEnabled                    ? "OFF"
+              : wfConnected && lastApiRefresh         ? timeStr(lastApiRefresh)
+              : wfConnected                           ? "Connected"
+              : warframeRunning                       ? "Connecting…"
+              : "Waiting";
+            const wfApiClick = (!wfConnected && warframeRunning && companionApiEnabled)
+              ? async () => {
+                  try {
+                    const [accountId, nonce, steamId] = await invoke<[string, string, string]>("scan_warframe_credentials");
+                    const data = await invoke<any>("fetch_warframe_inventory", { accountId, nonce, steamId });
+                    applyInventoryData(data);
+                    setWfConnected(true);
+                    wfConnectedRef.current = true;
+                    manualCredsRef.current = { accountId, nonce };
+                  } catch (e) {
+                    alert(`Credential scan failed:\n${e}\n\nMake sure you are in the Orbiter (not in a mission or loading screen).`);
+                  }
                 }
-              }}
-            >⚡ Connecting… (click to retry)</span>
-          )}
+              : undefined;
+
+            // WFM chip
+            const wfmState: "online"|"offline" = wfmLoggedIn ? "online" : "offline";
+            const wfmDetail = wfmLoggedIn ? "Online" : "Not logged in";
+
+            return (
+              <>
+                <span
+                  className={`conn-chip conn-${scanState}`}
+                  title={!memoryScannerEnabled ? "Memory Scanner disabled — enable in Settings" : warframeRunning ? `Last scan: ${lastScan ? new Date(lastScan * 1000).toLocaleTimeString() : "—"}` : "Warframe not detected"}
+                  onClick={!memoryScannerEnabled ? () => setShowSettings(true) : undefined}
+                >
+                  <span className="conn-dot" />
+                  <span className="conn-label">Scanner</span>
+                  <span className="conn-detail">{scanDetail}</span>
+                </span>
+                <span
+                  className={`conn-chip conn-${wfApiState}`}
+                  title={!companionApiEnabled ? "Warframe API disabled — enable in Settings" : wfConnected ? "Warframe API connected — auto-refreshes every 30s" : warframeRunning ? "Click to retry credential scan" : "Waiting for Warframe to start"}
+                  onClick={!companionApiEnabled ? () => setShowSettings(true) : wfApiClick}
+                  style={wfApiClick ? { cursor: "pointer" } : undefined}
+                >
+                  <span className="conn-dot" />
+                  <span className="conn-label">WF API</span>
+                  <span className="conn-detail">{wfApiDetail}</span>
+                </span>
+                <span
+                  className={`conn-chip conn-${wfmState}`}
+                  title={wfmLoggedIn ? "Logged in to warframe.market" : "Not logged in to warframe.market — open the Market tab to log in"}
+                  onClick={!wfmLoggedIn ? () => setActiveModule("market") : undefined}
+                  style={!wfmLoggedIn ? { cursor: "pointer" } : undefined}
+                >
+                  <span className="conn-dot" />
+                  <span className="conn-label">WFM</span>
+                  <span className="conn-detail">{wfmDetail}</span>
+                </span>
+                {overlayStatus && (
+                  <span className="conn-chip conn-overlay">
+                    <span className="conn-dot" />
+                    <span className="conn-detail">{overlayStatus}</span>
+                  </span>
+                )}
+              </>
+            );
+          })()}
           <button
             className={`btn-monitor ${monitoring ? "active" : ""}`}
             onClick={memoryScannerEnabled ? toggleMonitor : undefined}
@@ -1948,7 +1993,7 @@ export default function App() {
 
         {/* ── Market Helper module ── */}
         {activeModule === "market" && (
-          <MarketHelper quantities={mergedQty} apiQuantities={apiQuantities} refreshKey={itemsRefreshKey} crafting={crafting} />
+          <MarketHelper quantities={mergedQty} apiQuantities={apiQuantities} refreshKey={itemsRefreshKey} crafting={crafting} onWfmLoginChange={setWfmLoggedIn} />
         )}
 
         {/* ── Relics module ── */}

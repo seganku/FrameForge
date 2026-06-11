@@ -82,7 +82,13 @@ function resolveOwnedFn(
   const catClk = catEntry
     ? (catEntry.unique_name as string).replace("/Lotus/StoreItems/", "/Lotus/")
     : clk;
-  const directQty = qty[catClk] ?? qty[clk] ?? qty[uniqueName] ?? 0;
+  // Also try the raw catalog path (before StoreItems stripping) in case game memory
+  // stores the item with the /Lotus/StoreItems/ prefix intact.
+  const directQty = qty[catClk]
+    ?? (catEntry ? (qty as Record<string,number>)[catEntry.unique_name] : undefined)
+    ?? qty[clk]
+    ?? qty[uniqueName]
+    ?? 0;
 
   let altQty = 0;
   let altClk: string | null = null;

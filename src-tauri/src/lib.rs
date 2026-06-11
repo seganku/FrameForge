@@ -113,7 +113,10 @@ fn fix_category(name: &str, wfcd_cat: &str) -> String {
     const PART_SUFFIXES: &[&str] = &[
         " receiver", " stock", " barrel", " blade", " handle", " guard",
         " hilt", " link", " gauntlet", " carapace", " cerebrum", " systems",
-        " upper limb", " lower limb", " strike", " boot", " head",
+        " upper limb", " lower limb", " strike", " boot", " head", " grip",
+        // Additional weapon-component suffixes not covered above:
+        // bow string, throwing-star disc, throwing-star stars
+        " string", " disc", " stars",
     ];
     if PART_SUFFIXES.iter().any(|s| lower.ends_with(s)) {
         return "Parts".to_string();
@@ -179,6 +182,19 @@ fn get_all_items(state: State<AppState>) -> Vec<CatalogItem> {
         .map(|i| (i.name.to_lowercase(), i.vaulted))
         .collect();
 
+    // Vaulted lookup helper: exact name → base without " Blueprint" → "X Prime" set entry.
+    // WFCD's vaulted flag is most reliably set on the assembled warframe/weapon ("Mag Prime",
+    // "Venato Prime") rather than on every individual component.  Falling back to the set entry
+    // means components never lose the lock icon just because WFCD left their own field null.
+    let prime_vaulted = |name: &str| -> Option<bool> {
+        let n = name.to_lowercase();
+        let base = n.strip_suffix(" blueprint").unwrap_or(&n).to_string();
+        let prime_key = n.find("prime").map(|pos| n[..pos + 5].to_string());
+        wfcd_vaulted.get(&n).and_then(|v| *v)
+            .or_else(|| wfcd_vaulted.get(&base).and_then(|v| *v))
+            .or_else(|| prime_key.as_deref().and_then(|pk| wfcd_vaulted.get(pk).and_then(|v| *v)))
+    };
+
     let mut bp_names_added: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for (bp_unique, (bp_name, bp_ducats)) in bp_names.iter() {
@@ -192,9 +208,7 @@ fn get_all_items(state: State<AppState>) -> Vec<CatalogItem> {
 
         let n = bp_name.to_lowercase();
         if bp_names_added.insert(n.clone()) {
-            // Inherit vaulted status from WFCD — try exact name first, then base name.
-            let vaulted = wfcd_vaulted.get(&n).and_then(|v| *v)
-                .or_else(|| wfcd_vaulted.get(&base).and_then(|v| *v));
+            let vaulted = prime_vaulted(bp_name);
             result.push(CatalogItem {
                 unique_name: bp_unique.clone(),
                 name:        bp_name.clone(),
@@ -216,12 +230,16 @@ fn get_all_items(state: State<AppState>) -> Vec<CatalogItem> {
         if cat == "Blueprints" {
             if !bp_names_added.insert(n) { continue; } // skip if already seen
         }
+        // Inherit vaulted from the prime set entry when WFCD left the component field null.
+        let vaulted = i.vaulted.or_else(|| {
+            if i.name.to_lowercase().contains("prime") { prime_vaulted(&i.name) } else { None }
+        });
         result.push(CatalogItem {
             unique_name: i.unique_name.clone(),
             name:        i.name.clone(),
             category:    cat,
             image_name:  i.image_name.clone(),
-            vaulted:     i.vaulted,
+            vaulted,
             ducats:      i.ducats,
             mastery_req: i.mastery_req,
         });
@@ -232,12 +250,15 @@ fn get_all_items(state: State<AppState>) -> Vec<CatalogItem> {
         if !item.unique_name.starts_with("/Lotus/Types/Recipes/") { continue; }
         let n = item.name.to_lowercase();
         if !bp_names_added.insert(n) { continue; }
+        let vaulted = item.vaulted.or_else(|| {
+            if item.name.to_lowercase().contains("prime") { prime_vaulted(&item.name) } else { None }
+        });
         result.push(CatalogItem {
             unique_name: item.unique_name.clone(),
             name:        item.name.clone(),
             category:    "Blueprints".to_string(),
             image_name:  item.image_name.clone(),
-            vaulted:     item.vaulted,
+            vaulted,
             ducats:      item.ducats,
             mastery_req: item.mastery_req,
         });
@@ -2909,6 +2930,24 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
     let items = state.wfcd_items.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let unique_names: Vec<String> = items.iter().map(|i| i.unique_name.clone()).collect();
     let display_names: Vec<String> = items.iter().map(|i| i.name.clone()).collect();
+    // Truly-assembled items only (not parts/blueprints) — used to build the scanner's
+    // unique_path_set so component parts at /Lotus/Weapons/ paths are NOT skipped by
+    // Scanner 1 (e.g. "Paris Prime String" lives at /Lotus/Weapons/... but is a Part).
+    let assembled_names: Vec<String> = items.iter()
+        .filter(|i| {
+            let cat = fix_category(&i.name, &i.category);
+            if matches!(cat.as_str(), "Parts" | "Blueprints" | "Mods" | "Arcanes") { return false; }
+            i.unique_name.starts_with("/Lotus/Powersuits/")
+                || i.unique_name.starts_with("/Lotus/Weapons/")
+                || i.unique_name.starts_with("/Lotus/Archwing/")
+                || i.unique_name.starts_with("/Lotus/Types/Sentinels/SentinelPowersuits/")
+                || i.unique_name.starts_with("/Lotus/Types/Sentinels/SentinelWeapons/")
+                || i.unique_name.starts_with("/Lotus/Types/Friendly/")
+                || i.unique_name.starts_with("/Lotus/Types/Game/CatbrowPet/")
+                || i.unique_name.starts_with("/Lotus/Types/Game/KubrowPet/")
+        })
+        .map(|i| i.unique_name.clone())
+        .collect();
     let flag = state.monitor_active.clone();
     let db_path = state.db_path.clone();
     let log_path = state.log_path.clone();
@@ -2943,7 +2982,7 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
         let mut last_snapshot_date = String::new();
 
         while flag.load(Ordering::SeqCst) {
-            let result = memory_scanner::scan_warframe_memory(&unique_names, &display_names);
+            let result = memory_scanner::scan_warframe_memory(&unique_names, &display_names, &assembled_names);
             let now = chrono::Utc::now().timestamp();
             let now_str = chrono::DateTime::from_timestamp(now, 0)
                 .map(|dt: chrono::DateTime<chrono::Utc>| dt.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -3024,13 +3063,16 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
             // Clear pending entries for items no longer visible in memory
             pending.retain(|k, _| seen_this_scan.contains_key(k));
 
-            // Track warframe ownership across consecutive scans.
+            // Track warframe and sentinel ownership across consecutive scans.
             // Weapons are intentionally excluded: other players' equipped weapons appear in
             // the same memory regions and would cause false "FULL ITEM OWNED" results.
-            // Warframes are 1-per-player in a squad, so false positives are far less likely.
+            // Warframes/sentinels are 1-per-player in a squad, so false positives are far
+            // less likely — a sentinel appearing twice across scans is almost certainly owned.
             for item in &result.items_found {
                 if item.explicit_count { continue; }
-                if !item.unique_name.starts_with("/Lotus/Powersuits/") { continue; }
+                if !item.unique_name.starts_with("/Lotus/Powersuits/")
+                    && !item.unique_name.starts_with("/Lotus/Types/Sentinels/SentinelPowersuits/")
+                { continue; }
                 let e = unique_stable.entry(item.unique_name.clone()).or_insert(0u8);
                 if *e < 2 { *e += 1; }
             }
@@ -3322,7 +3364,6 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
             let mut pending_trade: Option<String> = None; // last seen trade confirmation dialog
             let mut vp_other_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut vp_own_item = String::new(); // local player's reward path from EE.log
-            let mut ee_squad_size: Option<usize> = None; // committed when sequence completes
             // Cooldown: after any dismiss, block new triggers for 60 s.
             // Prevents the overlay from re-firing on the Last Mission Results screen,
             // which replays some EE.log events from the same mission.
@@ -3357,7 +3398,10 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                         vp_in_seq  = true;
                         vp_other_ids.clear();
                         vp_own_item.clear();
-                        ee_squad_size = None;
+                        // Reset the shared mutex so any OCR loop that's still
+                        // retrying from a previous fissure doesn't carry a stale
+                        // squad count into the next one.
+                        if let Ok(mut g) = shared_squad_size2.lock() { *g = None; }
                     }
                     if vp_in_seq {
                         if ll.contains("gets reward /lotus/") {
@@ -3372,8 +3416,7 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                         } else if ll.contains("has reward info for all players now") {
                             // squad = local player (1) + unique other IDs seen
                             let squad = (1 + vp_other_ids.len()).clamp(1, 4);
-                            ee_squad_size = Some(squad);
-                            // Share with OCR loop so any pending retry uses the correct count.
+                            // Update the shared mutex so any pending OCR retry reads the correct count.
                             if let Ok(mut g) = shared_squad_size2.lock() { *g = Some(squad); }
                             vp_in_seq = false;
                             vp_seq_completed = true; // fallback trigger signal
@@ -3672,9 +3715,11 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                     let slog       = session_log_path.clone();
                     let active     = reward_screen_active2.clone();
                     let squad_arc  = std::sync::Arc::clone(&shared_squad_size);
-                    // Also reset the shared squad size so stale data from a previous
-                    // fissure doesn't bleed into this new screen's OCR loop.
-                    if let Ok(mut g) = squad_arc.lock() { *g = ee_squad_size; }
+                    // Do NOT write ee_squad_size here. The mutex is already reset to None
+                    // when GetVoidProjectionRewards fires (above), and is updated to the
+                    // correct squad count when the sequence completes (line ~3395).
+                    // Writing ee_squad_size here would corrupt the mutex if the sequence
+                    // completed in this same poll (the per-line loop runs before this code).
 
                     tauri::async_runtime::spawn(async move {
                         let deadline = std::time::Instant::now()
@@ -3737,16 +3782,23 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                             }
                             let _ = app.emit("ff-status", "📷 OCR scanning...");
                             let cat2 = std::sync::Arc::clone(&cat);
-                            // Read squad size fresh for each attempt — it may arrive after
-                            // the first attempt if VoidProjections sequence completes late.
-                            let hint_squad = squad_arc.lock().ok().and_then(|g| *g);
+                            // Clone the Arc so the hint can be read inside spawn_blocking.
+                            // Reading AFTER capture (~100-400 ms) rather than before gives the
+                            // EE.log VoidProjections sequence time to complete and write the
+                            // correct squad count before we decide how many columns to use.
+                            let squad_arc2 = std::sync::Arc::clone(&squad_arc);
                             let result = tauri::async_runtime::spawn_blocking(move || {
                                 let (pixels, w, cap_h, full_h, cap_info) =
                                     ocr::capture_warframe_reward_area()?;
+                                // Read hint AFTER capture — the sequence may have completed
+                                // during the PrintWindow/DXGI call.
+                                let hint_squad = squad_arc2.lock().ok().and_then(|g| *g);
                                 Some(ocr::extract_reward_items_twophase(
                                     &pixels, w, cap_h, full_h, &cat2, &cap_info, hint_squad,
                                 ))
                             }).await.ok().flatten();
+                            // Re-read hint for confirm_ready logic below (same mutex, post-capture value).
+                            let hint_squad = squad_arc.lock().ok().and_then(|g| *g);
 
                             let ts = chrono::Local::now().format("%H:%M:%S%.3f");
                             let sleep_ms = match &result {
