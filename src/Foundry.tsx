@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { HelpTip } from "./HelpTip";
+import sentientIcon from "./assets/SentientFactionIcon.webp";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -141,17 +142,6 @@ function ArchonCrystalIcon({ shards }: { shards: ArchonShard[] }) {
   }
 }
 
-function HelminthIcon() {
-  return (
-    <svg width="13" height="13" viewBox="0 0 13 13" fill="none" xmlns="http://www.w3.org/2000/svg">
-      <circle cx="6.5" cy="6.5" r="5.5" fill="#1a3d1a" stroke="#5fbf4f" strokeWidth="1"/>
-      <ellipse cx="6.5" cy="8" rx="3" ry="1.5" fill="#5fbf4f" opacity="0.8"/>
-      <circle cx="4.5" cy="5.5" r="1" fill="#5fbf4f"/>
-      <circle cx="8.5" cy="5.5" r="1" fill="#5fbf4f"/>
-      <path d="M4 8 L4.5 9.2 M5 8 L5 9.2 M6 7.8 L6 9.2 M7 7.8 L7 9.2 M8 8 L7.5 9.2 M9 8 L8.5 9.2" stroke="#1a3d1a" strokeWidth="0.5"/>
-    </svg>
-  );
-}
 
 function RelicIcon() {
   return (
@@ -378,8 +368,9 @@ function CraftCard({ item, recipe, quantities, relicDrops, relicNames, masteryDa
         <span className="cc-name">{item.name}</span>
       </div>
 
-      {/* Col 1, row 5: MR requirement */}
+      {/* Col 1, row 5: MR requirement + subsumed indicator */}
       <div className="cc-mr">
+        {isSubsumed && <img src={sentientIcon} className="cc-subsumed-icon" title="Subsumed into Helminth" alt="Subsumed" />}
         {item.mastery_req != null && item.mastery_req > 0 &&
           <span className="craft-mr-req">MR {item.mastery_req}</span>}
       </div>
@@ -396,7 +387,6 @@ function CraftCard({ item, recipe, quantities, relicDrops, relicNames, masteryDa
         {isMastered && <span className="craft-icon-tag craft-icon-mastered" title="Mastered">★</span>}
         {isOwned && !isMastered && rank != null && <span className="craft-icon-tag craft-icon-rank">R{rank}</span>}
         {isCrafting  && <span className="craft-icon-tag craft-icon-foundry" title="Building">⚒</span>}
-        {isSubsumed  && <span className="craft-icon-tag craft-icon-helminth" title="Subsumed"><HelminthIcon /></span>}
         {shards.length > 0 && <ArchonCrystalIcon shards={shards} />}
         {isOwned     && <span className="foundry-cb-badge foundry-cb-owned">✓✓</span>}
         {!isOwned && allParts && <span className="foundry-cb-badge foundry-cb-ready">⚡</span>}

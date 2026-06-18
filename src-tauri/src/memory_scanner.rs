@@ -7,6 +7,16 @@ pub struct FoundItem {
     pub name: String,
     pub quantity: i64,
     pub explicit_count: bool,
+    /// Raw memory context around where this item was found (printable ASCII, non-printable → '·')
+    pub context: String,
+}
+
+fn extract_context(data: &[u8], match_pos: usize, before: usize, after: usize) -> String {
+    let start = match_pos.saturating_sub(before);
+    let end = data.len().min(match_pos + after);
+    data[start..end].iter()
+        .map(|&b| if b >= 0x20 && b < 0x7f { b as char } else { '·' })
+        .collect()
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -40,6 +50,17 @@ pub struct ScanResult {
 }
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────
+
+/// Returns true if fewer than 25% of the `window` bytes before `pos` are non-printable.
+/// Stale/freed heap allocations have binary garbage before the JSON fragment;
+/// live inventory blobs are pure ASCII JSON — this rejects the stale ones.
+fn has_clean_prefix(data: &[u8], pos: usize, window: usize) -> bool {
+    let start = pos.saturating_sub(window);
+    let slice = &data[start..pos];
+    if slice.is_empty() { return true; }
+    let non_printable = slice.iter().filter(|&&b| b < 0x20 || b >= 0x7f).count();
+    non_printable * 4 <= slice.len() // ≤25%
+}
 
 fn parse_int(data: &[u8], start: usize) -> Option<i64> {
     let mut n: i64 = 0;
@@ -80,11 +101,11 @@ fn digits_end(data: &[u8], start: usize) -> usize {
 // an ItemCount from one JSON object accidentally pairs with an ItemType from a
 // different nearby object (which caused Fieldron to flip between 1 and 3).
 
-fn scan_inventory_resources(data: &[u8], unique_paths: &std::collections::HashSet<String>) -> Vec<(String, i64)> {
+fn scan_inventory_resources(data: &[u8], unique_paths: &std::collections::HashSet<String>) -> Vec<(String, i64, String)> {
     let count_key = b"\"ItemCount\":";
     let type_key  = b"\"ItemType\":\"";
 
-    let mut results: HashMap<String, i64> = HashMap::new();
+    let mut results: HashMap<String, (i64, String)> = HashMap::new();
     let mut pos = 0usize;
 
     loop {
@@ -136,17 +157,23 @@ fn scan_inventory_resources(data: &[u8], unique_paths: &std::collections::HashSe
         if unique_paths.contains(&path) { pos = count_pos + 1; continue; }
         if path.starts_with("/Lotus/Upgrades/") { pos = count_pos + 1; continue; }
 
+        // Reject stale heap allocations: live inventory JSON is pure printable ASCII,
+        // but freed/reused allocations have binary garbage before the fragment.
+        if !has_clean_prefix(data, count_pos, 300) { pos = count_pos + 1; continue; }
+
         let cap: i64 = if path.starts_with("/Lotus/Types/Recipes/") { 9_999 } else { 1_000_000 };
         if qty <= cap {
             // Keep the FIRST occurrence (lowest address). The real inventory JSON is always
             // at lower addresses than any injected companion-tool data, so first-wins is correct.
-            results.entry(path).or_insert(qty);
+            results.entry(path).or_insert_with(|| {
+                (qty, extract_context(data, count_pos, 300, 200))
+            });
         }
 
         pos = path_end + 1;
     }
 
-    results.into_iter().collect()
+    results.into_iter().map(|(k, (q, c))| (k, q, c)).collect()
 }
 
 // ─── Scanner 1b: Mods / Arcanes ──────────────────────────────────────────────
@@ -158,22 +185,35 @@ fn scan_inventory_resources(data: &[u8], unique_paths: &std::collections::HashSe
 // backwards with brace-depth tracking to locate ItemCount in the same object.
 // Entries with a single copy omit ItemCount entirely (implicit qty = 1).
 
-fn scan_inventory_mods(data: &[u8]) -> Vec<(String, i64)> {
+fn scan_inventory_mods(data: &[u8]) -> Vec<(String, i64, String)> {
     const RAW_KEY:   &[u8] = b"\"RawUpgrades\":[";
     const TYPE_KEY:  &[u8] = b"\"ItemType\":\"";
     const COUNT_KEY: &[u8] = b"\"ItemCount\":";
     const MOD_PFX:   &[u8] = b"/Lotus/Upgrades/";
 
-    let mut results: HashMap<String, i64> = HashMap::new();
+    let mut results: HashMap<String, (i64, String)> = HashMap::new();
     let mut outer = 0usize;
+
+    const INV_CHANGES_KEY: &[u8] = b"\"InventoryChanges\"";
 
     'outer: loop {
         let rel = match data[outer..].windows(RAW_KEY.len()).position(|w| w == RAW_KEY) {
             Some(p) => p,
             None => break,
         };
-        let section_start = outer + rel + RAW_KEY.len();
+        let raw_match_pos = outer + rel;
+        let section_start = raw_match_pos + RAW_KEY.len();
         outer = section_start;
+
+        // Skip RawUpgrades arrays that belong to an InventoryChanges delta record.
+        // Those blobs hold the per-mission delta (qty=1 for "you picked this up"),
+        // not the authoritative total. They always appear as:
+        //   "InventoryChanges":{"RawUpgrades":[...]}
+        // so "InventoryChanges" will be within ~200 bytes before this match.
+        let look_back = raw_match_pos.saturating_sub(200);
+        if data[look_back..raw_match_pos].windows(INV_CHANGES_KEY.len()).any(|w| w == INV_CHANGES_KEY) {
+            continue;
+        }
 
         // 2 MB cap — accounts with thousands of mods need more room than 256 KB
         let section_end = (section_start + 2 * 1024 * 1024).min(data.len());
@@ -241,12 +281,15 @@ fn scan_inventory_mods(data: &[u8]) -> Vec<(String, i64)> {
             };
 
             // Accumulate — same path can appear multiple times (different rank copies)
-            *results.entry(path).or_insert(0) += qty;
+            let entry = results.entry(path.clone()).or_insert_with(|| {
+                (0, extract_context(data, section_start + pos + type_rel, 300, 200))
+            });
+            entry.0 += qty;
             pos = path_end + 1;
         }
     }
 
-    results.into_iter().collect()
+    results.into_iter().map(|(k, (q, c))| (k, q, c)).collect()
 }
 
 // ─── Scanner 2: Unique items (warframes / weapons / companions) ───────────────
@@ -647,7 +690,7 @@ pub fn scan_warframe_memory(
         },
     };
 
-    let mut resources:    HashMap<String, i64>   = HashMap::new();
+    let mut resources:    HashMap<String, (i64, String)> = HashMap::new();
     let mut unique:       HashMap<String, usize> = HashMap::new(); // path → best region hit-count
     let mut mastery_data: HashMap<String, u32>   = HashMap::new(); // path → max rank seen
     let mut pending_recipes: Vec<PendingRecipe>            = Vec::new();
@@ -711,12 +754,12 @@ pub fn scan_warframe_memory(
             let res_pairs = scan_inventory_resources(data, &unique_path_set);
             if !res_pairs.is_empty() {
                 log_lines.push(format!("  [hint-resources] count={} addr=0x{:x}", res_pairs.len(), hint_base));
-                for (path, qty) in res_pairs { resources.entry(path).or_insert(qty); }
+                for (path, qty, ctx) in res_pairs { resources.entry(path).or_insert((qty, ctx)); }
             }
             let mod_pairs = scan_inventory_mods(data);
             if !mod_pairs.is_empty() {
                 log_lines.push(format!("  [hint-mods] count={}", mod_pairs.len()));
-                for (path, qty) in mod_pairs { resources.entry(path).or_insert(qty); }
+                for (path, qty, ctx) in mod_pairs { resources.entry(path).or_insert((qty, ctx)); }
             }
             if mastery_rank.is_none() { mastery_rank = scan_mastery_rank(data); }
             if has_number_long_in(data) {
@@ -816,15 +859,15 @@ pub fn scan_warframe_memory(
                 let res_pairs = scan_inventory_resources(data, &unique_path_set);
                 if !res_pairs.is_empty() {
                     let preview: String = res_pairs.iter().take(5)
-                        .map(|(p, q)| format!("{}={}", p.split('/').last().unwrap_or("?"), q))
+                        .map(|(p, q, _)| format!("{}={}", p.split('/').last().unwrap_or("?"), q))
                         .collect::<Vec<_>>().join(", ");
                     log_lines.push(format!(
                         "  [resources] count={}  {}{}",
                         res_pairs.len(), preview,
                         if res_pairs.len() > 5 { format!(" +{} more", res_pairs.len()-5) } else { String::new() }
                     ));
-                    for (path, qty) in res_pairs {
-                        resources.entry(path).or_insert(qty);
+                    for (path, qty, ctx) in res_pairs {
+                        resources.entry(path).or_insert((qty, ctx));
                     }
                 } else if res_probe_count < 5 {
                     res_probe_count += 1;
@@ -846,8 +889,8 @@ pub fn scan_warframe_memory(
                 let mod_pairs = scan_inventory_mods(data);
                 if !mod_pairs.is_empty() {
                     log_lines.push(format!("  [mods] count={}", mod_pairs.len()));
-                    for (path, qty) in mod_pairs {
-                        resources.entry(path).or_insert(qty);
+                    for (path, qty, ctx) in mod_pairs {
+                        resources.entry(path).or_insert((qty, ctx));
                     }
                 }
             }
@@ -898,13 +941,14 @@ pub fn scan_warframe_memory(
 
     let mut items_found: Vec<FoundItem> = Vec::new();
 
-    for (path, qty) in &resources {
+    for (path, (qty, ctx)) in &resources {
         if let Some(name) = display_map.get(path) {
             items_found.push(FoundItem {
                 unique_name: path.clone(),
                 name: name.clone(),
                 quantity: *qty,
                 explicit_count: true,
+                context: ctx.clone(),
             });
         }
     }
@@ -923,6 +967,7 @@ pub fn scan_warframe_memory(
                 name: name.clone(),
                 quantity: 1,
                 explicit_count: false,
+                context: String::new(),
             });
         }
     }
@@ -1304,7 +1349,7 @@ fn find_warframe_pid() -> Option<u32> {
             loop {
                 let name_len = entry.szExeFile.iter().position(|&b| b == 0).unwrap_or(260);
                 let name = String::from_utf8_lossy(&entry.szExeFile[..name_len]).to_lowercase();
-                if name.starts_with("warframe") && !name.contains("launcher") {
+                if name.starts_with("warframe") && !name.contains("launcher") && !name.contains("companion") {
                     found = Some(entry.th32ProcessID);
                     break;
                 }

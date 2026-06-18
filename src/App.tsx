@@ -347,7 +347,13 @@ export default function App() {
   const [memoryScannerEnabled, setMemoryScannerEnabled] = useState(false);
   const [wfmLoggedIn, setWfmLoggedIn] = useState(false);
   const [overlayStatus, setOverlayStatus] = useState("");
-  const [subsummedWarframes, setSubsummedWarframes] = useState<Set<string>>(new Set());
+  const [subsummedWarframes, setSubsummedWarframes] = useState<Set<string>>(() => {
+    try {
+      const saved = localStorage.getItem("ff-subsumed-warframes");
+      if (saved) return new Set<string>(JSON.parse(saved));
+    } catch {}
+    return new Set<string>();
+  });
   const [archonShards, setArchonShards] = useState<Record<string, {type: string; tauforged: boolean; color: string; boost?: string}[]>>({});
   const [lastApiRefresh, setLastApiRefresh] = useState<number | null>(null);
   const wfConnectedRef = useRef(false);
@@ -539,23 +545,25 @@ export default function App() {
       setRecipeCount(s.recipe_count);
     });
 
-    // Check for updates from GitHub
+    // Check for updates from GitHub on launch and every hour
+    const semverGt = (a: string, b: string) => {
+      const [ma, mi, pa] = a.split(".").map(Number);
+      const [mb, mii, pb] = b.split(".").map(Number);
+      if (ma !== mb) return ma > mb;
+      if (mi !== mii) return mi > mii;
+      return pa > pb;
+    };
+    const checkForUpdate = (v: string) =>
+      fetch("https://api.github.com/repos/WyrmStudios/FrameForge/releases/latest")
+        .then(r => r.json())
+        .then(d => { const latest = (d.tag_name ?? "").replace(/^v/, ""); if (latest && semverGt(latest, v)) setUpdateAvailable(latest); })
+        .catch(() => {});
+
     getVersion().then(v => {
       setAppVersion(v);
-      fetch("https://api.github.com/repos/Sikewyrm/FrameForge/releases/latest")
-        .then(r => r.json())
-        .then(d => {
-          const latest = (d.tag_name ?? "").replace(/^v/, "");
-          const semverGt = (a: string, b: string) => {
-            const [ma, mi, pa] = a.split(".").map(Number);
-            const [mb, mii, pb] = b.split(".").map(Number);
-            if (ma !== mb) return ma > mb;
-            if (mi !== mii) return mi > mii;
-            return pa > pb;
-          };
-          if (latest && semverGt(latest, v)) setUpdateAvailable(latest);
-        })
-        .catch(() => {});
+      checkForUpdate(v);
+      const interval = setInterval(() => checkForUpdate(v), 60 * 60 * 1000);
+      return () => clearInterval(interval);
     }).catch(() => {});
 
     // Auto-start monitor on launch — only if memory scanner is explicitly enabled
@@ -587,9 +595,11 @@ export default function App() {
       setWarframeRunning(p.warframe_running);
       setLastScan(p.scanned_at);
       if (p.consumed_suits && p.consumed_suits.length > 0) {
+        console.log("[FrameForge] consumed_suits from scanner:", p.consumed_suits);
         setSubsummedWarframes(prev => {
           const next = new Set(prev);
           for (const s of p.consumed_suits!) next.add(s);
+          localStorage.setItem("ff-subsumed-warframes", JSON.stringify([...next]));
           return next;
         });
       }
@@ -770,7 +780,14 @@ export default function App() {
       }
     }
     setApiModCopies(copies);
-    setApiQuantities(apiQty);
+    setApiQuantities(prev => {
+      const changes = Object.entries(apiQty)
+        .filter(([k, v]) => (prev[k] ?? 0) !== v)
+        .map(([k, v]) => ({ item_name: k, old_qty: prev[k] ?? 0, new_qty: v }));
+      if (changes.length > 0)
+        invoke("log_api_changes", { changes }).catch(() => {});
+      return apiQty;
+    });
     if (data.PlayerLevel != null) setMasteryRank(data.PlayerLevel);
 
     // Extract Archon Shard data from Suits
@@ -813,6 +830,7 @@ export default function App() {
       const s = new Set<string>(
         consumed.map((e: any) => (typeof e === "string" ? e : e?.ItemType ?? "")).filter(Boolean)
       );
+      localStorage.setItem("ff-subsumed-warframes", JSON.stringify([...s]));
       setSubsummedWarframes(s);
     }
 
@@ -1315,7 +1333,7 @@ export default function App() {
             <a
               className="update-badge"
               title={`v${updateAvailable} available — click to download`}
-              onClick={() => invoke("plugin:opener|open_url", { url: "https://github.com/Sikewyrm/FrameForge/releases/latest" }).catch(() => {})}
+              onClick={() => invoke("plugin:opener|open_url", { url: "https://github.com/WyrmStudios/FrameForge/releases/latest" }).catch(() => {})}
             >⬆ v{updateAvailable}</a>
           )}
         {masteryRank !== null && (
@@ -1430,6 +1448,15 @@ export default function App() {
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
               <path d="M23.881 8.948c-.773-4.085-4.859-4.593-4.859-4.593H.723c-.604 0-.679.798-.679.798s-.082 7.324-.022 11.822c.164 2.424 2.586 2.672 2.586 2.672s8.267-.023 11.966-.049c2.438-.426 2.683-2.566 2.658-3.734 4.352.24 7.422-2.831 6.649-6.916zm-11.062 3.511c-1.246 1.453-4.011 3.976-4.011 3.976s-.121.119-.31.023c-.076-.057-.108-.09-.108-.09-.443-.441-3.368-3.049-4.034-3.954-.709-.965-1.041-2.7-.091-3.71.951-1.01 3.005-1.086 4.363.407 0 0 1.565-1.782 3.468-.963 1.904.82 1.832 2.833.723 4.311zm6.173.478c-.928.116-1.218-.443-1.218-.443s.001-1.929 0-2.535c-.003-.434-.423-.782-.857-.782-.434 0-.836.348-.836.782v3.09c0 .434.402.782.836.782.434 0 .857-.026.857-.026s-.038.639.525.98c.562.341 1.423.231 1.423.231 1.302-.269 2.023-1.63 1.27-2.079z"/>
+            </svg>
+          </button>
+          <button
+            className="btn-icon-brand btn-report"
+            title="Report a bug or suggest a feature"
+            onClick={() => invoke("plugin:opener|open_url", { url: "https://github.com/WyrmStudios/FrameForge/issues/new/choose" }).catch(() => {})}
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+              <path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"/>
             </svg>
           </button>
           <button className="btn-settings" title="Settings" onClick={() => {

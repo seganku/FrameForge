@@ -149,6 +149,10 @@ html { zoom: var(--ff-scale, 1); }
   border-color: rgba(255,94,91,.45); background: rgba(255,94,91,.1); color: #ff7a77;
 }
 .btn-kofi:hover { background: rgba(255,94,91,.22); color: #ffb0ae; border-color: rgba(255,94,91,.8); }
+.btn-report {
+  border-color: rgba(110,118,129,.45); background: rgba(110,118,129,.1); color: #8b949e;
+}
+.btn-report:hover { background: rgba(110,118,129,.22); color: #cdd9e5; border-color: rgba(110,118,129,.8); }
 
 .btn-settings {
   background: none; border: none; cursor: pointer; font-size: 16px;
@@ -732,6 +736,11 @@ svg.item-img-fallback { background: transparent; border: none; padding: 0; }
 }
 .cc-image .item-img-fallback {
   width: 88px !important; height: 96px !important; border-radius: 0 !important;
+}
+.cc-subsumed-icon {
+  width: 16px; height: 16px; object-fit: contain; flex-shrink: 0;
+  filter: drop-shadow(0 0 2px rgba(0,0,0,.8));
+  pointer-events: none;
 }
 .cc-star {
   position: absolute; top: 3px; left: 5px;

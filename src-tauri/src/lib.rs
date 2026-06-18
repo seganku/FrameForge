@@ -22,6 +22,7 @@ pub struct AppState {
     pub quantities_cache_path: PathBuf,
     pub settings_path: PathBuf,
     pub log_path: PathBuf,
+    pub changes_log_path: PathBuf,
     pub conn: Mutex<rusqlite::Connection>,
     pub wfcd_items: Mutex<Vec<WfcdItem>>,
     /// parent unique_name → recipe component tree
@@ -2881,6 +2882,26 @@ fn read_scan_log(state: State<AppState>) -> Result<String, String> {
     std::fs::read_to_string(&state.log_path).map_err(|e| e.to_string())
 }
 
+#[derive(serde::Deserialize)]
+pub struct ApiChange {
+    pub item_name: String,
+    pub old_qty: i64,
+    pub new_qty: i64,
+}
+
+#[tauri::command]
+fn log_api_changes(state: State<AppState>, changes: Vec<ApiChange>) -> Result<(), String> {
+    let mut f = std::fs::OpenOptions::new()
+        .create(true).append(true)
+        .open(&state.changes_log_path)
+        .map_err(|e| e.to_string())?;
+    let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+    for c in &changes {
+        let _ = writeln!(f, "[{}] Companion API  | {} | {} → {}", ts, c.item_name, c.old_qty, c.new_qty);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn dump_memory_probe(state: State<'_, AppState>) -> Result<String, String> {
     let log_path = state.log_path.with_file_name("memory_probe.txt");
@@ -3017,6 +3038,7 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
     let flag = state.monitor_active.clone();
     let db_path = state.db_path.clone();
     let log_path = state.log_path.clone();
+    let changes_log_path = state.changes_log_path.clone();
     let quantities_cache_path = state.quantities_cache_path.clone();
     let shared_quantities = state.current_quantities.clone();
     let shared_unique     = state.unique_quantities.clone();
@@ -3083,7 +3105,7 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
         let mut pass_mastery_data: HashMap<String, u32> = HashMap::new();
         let mut pass_recipes: Vec<memory_scanner::PendingRecipe> = Vec::new();
         let mut pass_unique_seen: HashMap<String, ()> = HashMap::new();
-        // Consumed suits from memory — accumulated across windows, reset each full pass.
+        // Consumed suits persist across passes — subsumption is permanent, never un-subsumed.
         let mut pass_consumed_suits: Vec<String> = Vec::new();
 
         while flag.load(Ordering::SeqCst) {
@@ -3178,6 +3200,13 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                 };
                 let _ = db::add_quantity_change(&conn, &item.unique_name, &item.name, old_qty, new_qty);
                 known.insert(item.unique_name.clone(), new_qty);
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&changes_log_path) {
+                    let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+                    let _ = writeln!(f, "[{}] Memory Scanner | {} | {} → {}", ts, item.name, old_qty, new_qty);
+                    if !item.context.is_empty() {
+                        let _ = writeln!(f, "  context: {}", item.context);
+                    }
+                }
                 changes.push(change);
             }
 
@@ -3267,7 +3296,7 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                 pass_regions = 0;
                 pass_unique_seen.clear();
                 pass_recipes.clear();
-                pass_consumed_suits.clear();
+                // pass_consumed_suits intentionally NOT cleared — subsumption is permanent.
                 // Keep mastery data — it doesn't change often.
             }
         }
@@ -5206,6 +5235,7 @@ pub fn run() {
     let quantities_cache_path = data_dir.join("quantities_cache.json");
     let settings_path = data_dir.join("settings.json");
     let log_path = data_dir.join("scan_log.txt");
+    let changes_log_path = data_dir.join("inventory_changes.txt");
     let raw_scan_path = data_dir.join("raw_scan.txt");
     let wfm_top_cache_path = data_dir.join("wfm_top_cache.json");
     let syndicate_catalog_path = data_dir.join("syndicate_catalog.json");
@@ -5234,6 +5264,7 @@ pub fn run() {
             quantities_cache_path,
             settings_path,
             log_path,
+            changes_log_path,
             conn: Mutex::new(conn),
             wfcd_items: Mutex::new(initial_items),
             recipes: Mutex::new(initial_recipes),
@@ -5286,6 +5317,7 @@ pub fn run() {
             load_settings,
             save_settings,
             read_scan_log,
+            log_api_changes,
             dump_memory_probe,
             toggle_raw_scan,
             get_app_version,
