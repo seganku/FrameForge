@@ -4825,14 +4825,13 @@ dependencies = [
 
 [[package]]
 name = "warframe-companion"
-version = "1.12.0"
+version = "2.0.0"
 dependencies = [
  "aho-corasick",
  "chrono",
  "dirs 5.0.1",
  "lzma-rs",
  "native-tls",
- "png 0.17.16",
  "regex",
  "rusqlite",
  "serde",

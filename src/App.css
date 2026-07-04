@@ -37,6 +37,21 @@ html, body, #root { height: 100%; font-family: -apple-system, BlinkMacSystemFont
 }
 .header-right  { display: flex; align-items: center; gap: 6px; margin-left: auto; }
 
+.blob-status-badge {
+  font-size: 11px; font-weight: 600; border-radius: 5px;
+  padding: 2px 9px; flex-shrink: 0; letter-spacing: .02em;
+}
+.blob-status-scanning {
+  color: #64b5f6; background: rgba(100,181,246,.10);
+  border: 1px solid rgba(100,181,246,.30);
+  animation: blob-pulse 1.4s ease-in-out infinite;
+}
+.blob-status-done {
+  color: #3fb950; background: rgba(63,185,80,.10);
+  border: 1px solid rgba(63,185,80,.30);
+}
+@keyframes blob-pulse { 0%,100% { opacity: 1; } 50% { opacity: .5; } }
+
 /* Connection status chips */
 .conn-chip {
   display: inline-flex; align-items: center; gap: 5px;

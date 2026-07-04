@@ -284,11 +284,14 @@ pub fn capture_rect_and_ocr(x_start: f32, x_end: f32, y_start: f32, y_end: f32) 
 /// Captures the full Warframe window region from the desktop using GDI BitBlt.
 /// Because this reads the composited desktop surface (not the window in isolation),
 /// any Tauri overlay window sitting on top is included in the result.
+#[allow(dead_code)]
+/// Full-resolution capture — kept for future use; manual capture uses the half-res variant.
+/// Full-resolution capture for manual diagnostics.
 /// Falls back to full-monitor DXGI if the frame is dark (fullscreen exclusive mode).
 /// Returns BGRA pixels, width, height.
 #[cfg(target_os = "windows")]
 pub fn capture_screen_for_diagnostics() -> Result<(Vec<u8>, u32, u32), String> {
-    if let Some((pixels, w, h)) = capture_screen_gdi() {
+    if let Some((pixels, w, h)) = capture_screen_gdi_scaled(1, 1) {
         if avg_brightness(&pixels) >= 10 {
             return Ok((pixels, w, h));
         }
@@ -300,18 +303,37 @@ pub fn capture_screen_for_diagnostics() -> Result<(Vec<u8>, u32, u32), String> {
     }
 }
 
-/// GDI BitBlt from the desktop DC covering the Warframe window's screen rectangle.
-/// DWM composites all windows before BitBlt reads them, so overlay windows appear.
+/// Half-resolution capture for automatic diagnostics.
+/// StretchBlt writes a smaller destination bitmap so GetDIBits reads 4× less data,
+/// reducing GPU pipeline stalls on high-resolution displays.
 #[cfg(target_os = "windows")]
-fn capture_screen_gdi() -> Option<(Vec<u8>, u32, u32)> {
+pub fn capture_screen_for_diagnostics_half() -> Result<(Vec<u8>, u32, u32), String> {
+    if let Some((pixels, w, h)) = capture_screen_gdi_scaled(1, 2) {
+        if avg_brightness(&pixels) >= 10 {
+            return Ok((pixels, w, h));
+        }
+    }
+    match capture_dxgi(1.0) {
+        Some((pixels, w, _cap_h, full_h)) => Ok((pixels, w, full_h)),
+        None => Err("Warframe window not found or capture failed".into()),
+    }
+}
+
+/// GDI capture of the Warframe window at a fractional scale (num/denom).
+/// Uses StretchBlt so the destination bitmap — and therefore the GetDIBits readback —
+/// is (num/denom)² smaller, which reduces GPU pipeline stall time proportionally.
+/// Pass (1, 1) for full resolution; (1, 2) for half resolution, etc.
+/// DWM composites all windows before BitBlt reads them, so overlay windows are visible.
+#[cfg(target_os = "windows")]
+fn capture_screen_gdi_scaled(num: u32, denom: u32) -> Option<(Vec<u8>, u32, u32)> {
     use std::mem;
     use windows_sys::Win32::{
         Foundation::RECT,
         Graphics::Gdi::{
-            BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
+            StretchBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
             GetDC, GetDIBits, ReleaseDC, SelectObject,
             BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, RGBQUAD,
-            SRCCOPY,
+            SRCCOPY, HALFTONE, SetStretchBltMode,
         },
         UI::WindowsAndMessaging::{FindWindowW, GetWindowRect},
     };
@@ -322,40 +344,49 @@ fn capture_screen_gdi() -> Option<(Vec<u8>, u32, u32)> {
 
         let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
         GetWindowRect(hwnd, &mut rect);
-        let w = (rect.right  - rect.left) as u32;
-        let h = (rect.bottom - rect.top)  as u32;
-        if w < 100 || h < 100 { return None; }
+        let src_w = (rect.right  - rect.left) as u32;
+        let src_h = (rect.bottom - rect.top)  as u32;
+        if src_w < 100 || src_h < 100 { return None; }
+
+        // Destination size after scale — at least 1 pixel each dimension.
+        let dst_w = ((src_w * num) / denom).max(1);
+        let dst_h = ((src_h * num) / denom).max(1);
 
         let hdc_screen = GetDC(0);
         let hdc_mem    = CreateCompatibleDC(hdc_screen);
-        let hbm        = CreateCompatibleBitmap(hdc_screen, w as i32, h as i32);
+        let hbm        = CreateCompatibleBitmap(hdc_screen, dst_w as i32, dst_h as i32);
         let hbm_old    = SelectObject(hdc_mem, hbm);
 
-        BitBlt(hdc_mem, 0, 0, w as i32, h as i32,
-               hdc_screen, rect.left, rect.top, SRCCOPY);
+        // HALFTONE gives better quality when downscaling.
+        SetStretchBltMode(hdc_mem, HALFTONE as i32);
+        StretchBlt(
+            hdc_mem,    0, 0, dst_w as i32, dst_h as i32,  // dest
+            hdc_screen, rect.left, rect.top, src_w as i32, src_h as i32, // src
+            SRCCOPY,
+        );
 
         let mut bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
-                biSize:          mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth:         w as i32,
-                biHeight:        -(h as i32), // negative = top-down row order
-                biPlanes:        1,
-                biBitCount:      32,
-                biCompression:   BI_RGB,
-                biSizeImage:     0, biXPelsPerMeter: 0, biYPelsPerMeter: 0,
-                biClrUsed:       0, biClrImportant:  0,
+                biSize:        mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth:       dst_w as i32,
+                biHeight:      -(dst_h as i32), // negative = top-down row order
+                biPlanes:      1,
+                biBitCount:    32,
+                biCompression: BI_RGB,
+                biSizeImage: 0, biXPelsPerMeter: 0, biYPelsPerMeter: 0,
+                biClrUsed: 0, biClrImportant: 0,
             },
             bmiColors: [RGBQUAD { rgbBlue: 0, rgbGreen: 0, rgbRed: 0, rgbReserved: 0 }],
         };
-        let mut pixels = vec![0u8; (w * h * 4) as usize];
-        GetDIBits(hdc_mem, hbm, 0, h,
+        let mut pixels = vec![0u8; (dst_w * dst_h * 4) as usize];
+        GetDIBits(hdc_mem, hbm, 0, dst_h,
                   pixels.as_mut_ptr() as *mut _, &mut bmi, DIB_RGB_COLORS);
 
         SelectObject(hdc_mem, hbm_old);
         DeleteObject(hbm);
         DeleteDC(hdc_mem);
         ReleaseDC(0, hdc_screen);
-        Some((pixels, w, h))
+        Some((pixels, dst_w, dst_h))
     }
 }
 

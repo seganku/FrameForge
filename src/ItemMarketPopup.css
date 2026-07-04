@@ -146,6 +146,13 @@
   color: #f0c040;
 }
 
+.imp-col-sub {
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--muted);
+  margin-left: 4px;
+}
+
 .imp-col > .imp-order-row,
 .imp-col > .imp-loading,
 .imp-col > .imp-none {
@@ -236,6 +243,28 @@
   background: rgba(56,139,253,.15);
   border-color: var(--accent);
   color: var(--accent);
+}
+
+.imp-copy-btn {
+  background: none;
+  border: 1px solid rgba(48,54,61,.6);
+  color: var(--muted);
+  font-size: 11px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  cursor: pointer;
+  flex-shrink: 0;
+  line-height: 1.4;
+  transition: background .1s, border-color .1s, color .1s;
+}
+.imp-copy-btn:hover {
+  background: rgba(255,255,255,.06);
+  border-color: rgba(100,100,100,.6);
+  color: var(--text);
+}
+.imp-copy-btn-done {
+  border-color: rgba(80,200,80,.5) !important;
+  color: var(--green) !important;
 }
 
 /* ── Action bar ── */

@@ -1,4 +1,4 @@
-# FrameForge — Warframe Companion `v2.0.0`
+# FrameForge — Warframe Companion `v2.1.0`
 
 A desktop companion for Warframe — live inventory, market prices, trading, timers, relic overlay, and riven analysis. Read-only, no game modification.
 
@@ -9,7 +9,9 @@ A desktop companion for Warframe — live inventory, market prices, trading, tim
 ## Features
 
 ### Live Inventory
-Reads your inventory from Warframe's process memory (read-only, same API as Overwolf). Covers resources, mods, arcanes, relics, weapons, Warframes, companions, blueprints, and more — no login required. Inventory is persisted to disk and restored instantly on next launch.
+Reads your inventory directly from Warframe's process memory (read-only, same API as Overwolf). Instead of scanning for individual item patterns, FrameForge now locates and captures the full account JSON blob that the game client holds in memory — the same authoritative data the game itself uses.
+
+This gives complete coverage: resources, mods, arcanes, relics, weapons, Warframes, companions, blueprints, cosmetics (glyphs, palettes, emotes, titles, ship skins), sigils, pending Foundry jobs, credits, and more. Items that leave your inventory (traded, consumed, or expired) are correctly detected as dropped to zero. Inventory is persisted to disk and restored instantly on next launch — no login required.
 
 ### Foundry
 Browse every craftable item with full ingredient trees. Components are colour-coded by ownership status and show which relics drop them. Star items to track them in the Modular Window. Filter by Prime, Vaulted/Unvaulted, Owned/Unowned, Ready to build, and Mastered/Unmastered.
@@ -18,7 +20,12 @@ Browse every craftable item with full ingredient trees. Components are colour-co
 Browse Prime sets with live platinum prices from [warframe.market](https://warframe.market). Click any item for a live order popup with sell/buy orders, 3-week price chart, and one-click listing (requires WFM login).
 
 ### Trading
-Full warframe.market integration — manage active listings, post new orders, receive trade whispers from in-game chat, and set your online status. Session token stored in Windows Credential Manager.
+Full warframe.market integration — manage active listings, post new orders, and receive trade whispers from in-game chat.
+
+- **One-click whisper copy** — every order row has a 📋 button that copies the correct WFM trade message to your clipboard: `I want to buy` from sellers, `I want to sell` to buyers.
+- **Auto trade detection** — when a trade completes in-game, the matching WFM whisper is automatically marked complete, the sold reply is copied to your clipboard, and the whisper stays visible as a ghost for 5 minutes.
+- **Auto listing update** — after a sale is detected, the corresponding WFM sell listing is automatically decremented (or deleted if the last copy). A Revert button appears on the ghost whisper to undo the change if needed.
+- **Status auto-reconnect** — if WFM drops your status to offline, it is automatically restored without any action needed. Session token stored in Windows Credential Manager.
 
 ### Relic Helper
 Browse void fissure drop tables with rarity colour-coding, ownership status, and platinum values. Supports all refinement levels (Intact → Radiant).

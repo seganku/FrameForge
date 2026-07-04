@@ -8,6 +8,7 @@ import "./WfmTrading.css";
 
 interface WfmOrder {
   id: string;
+  itemId?: string;
   type: "sell" | "buy";
   platinum: number;
   quantity: number;
@@ -21,6 +22,17 @@ interface WfmWhisper {
   item?: string;
   price?: number;
   timestamp: string;
+  /** Set when auto-completed by in-game trade detection. Ghost stays visible for 5 min. */
+  completedAt?: number;
+  /** Set after WFM listing is updated so the ghost can offer a Revert button. */
+  revertInfo?: {
+    orderId: string;
+    itemId: string;
+    platinum: number;
+    originalQty: number;
+    newQty: number;       // 0 means the order was deleted
+    visible: boolean;
+  };
 }
 
 interface WfmItemEntry { id: string; item_name: string; url_name: string; }
@@ -255,10 +267,22 @@ function ListingsPanel({ username: _username, itemIdMap, wfmItems, imageMap }: {
 
 // ── Messages panel ────────────────────────────────────────────────────────────
 
-function MessagesPanel({ username: _username }: { username: string }) {
+function MessagesPanel({ username: _username, wfmItems }: { username: string; wfmItems: WfmItemEntry[] }) {
   const [whispers, setWhispers] = useState<WfmWhisper[]>([]);
   const [copied, setCopied]     = useState<string | null>(null);
+  const [reverting, setReverting] = useState<number | null>(null);
   const bottomRef               = useRef<HTMLDivElement>(null);
+  const ghostTimers             = useRef<ReturnType<typeof setTimeout>[]>([]);
+  // Keep a stable ref so the trade-completed handler always sees current itemIdMap
+  const itemIdMapRef            = useRef<Map<string, string>>(new Map());
+
+  useEffect(() => {
+    itemIdMapRef.current = new Map(wfmItems.map(i => [i.id, i.item_name]));
+  }, [wfmItems]);
+
+  useEffect(() => {
+    return () => { ghostTimers.current.forEach(clearTimeout); };
+  }, []);
 
   useEffect(() => {
     const unlisten = listen<WfmWhisper>("wfm-whisper", e => {
@@ -266,6 +290,99 @@ function MessagesPanel({ username: _username }: { username: string }) {
     });
     return () => { unlisten.then(fn => fn()); };
   }, []);
+
+  // Auto-complete a matching whisper when an in-game trade finishes.
+  useEffect(() => {
+    const unlisten = listen<{
+      withPlayer: string; direction: string; itemName: string;
+      quantity: number; platinum: number; timestamp: string;
+    }>("trade-completed", (e) => {
+      const { withPlayer, direction, itemName, quantity } = e.payload;
+
+      // Phase 1: immediately mark the ghost (synchronous state update)
+      let matchedFrom: string | null = null;
+      setWhispers(prev => {
+        const idx = prev.findIndex(
+          w => !w.completedAt && w.from.toLowerCase() === withPlayer.toLowerCase()
+        );
+        if (idx === -1) return prev;
+
+        const updated = [...prev];
+        const now = Date.now();
+        updated[idx] = { ...updated[idx], completedAt: now };
+        matchedFrom = updated[idx].from;
+
+        // Copy the sold reply to clipboard automatically
+        const w = updated[idx];
+        if (w.item) {
+          navigator.clipboard.writeText(`/w ${w.from} ${w.item} sold! Thank you.`).catch(() => {});
+        }
+
+        // Remove the ghost after 5 minutes
+        const t = setTimeout(() => {
+          const cutoff = Date.now() - 5 * 60 * 1000;
+          setWhispers(curr => curr.filter(ww => !ww.completedAt || ww.completedAt > cutoff));
+        }, 5 * 60 * 1000);
+        ghostTimers.current.push(t);
+
+        return updated;
+      });
+
+      // Phase 2: update WFM listing and attach revert info (async, only for sales)
+      if (direction === "sold") {
+        (async () => {
+          try {
+            const allOrders = await invokeWfm<WfmOrder[]>("wfm_get_orders");
+            const sellOrders = (allOrders ?? []).filter(o => o.type === "sell");
+            const idMap = itemIdMapRef.current;
+            const tradeLower = itemName.toLowerCase();
+
+            // Match by display name — exact first, then substring
+            const match = sellOrders.find(o => orderName(o, idMap).toLowerCase() === tradeLower)
+              ?? sellOrders.find(o => {
+                const n = orderName(o, idMap).toLowerCase();
+                return n.includes(tradeLower) || tradeLower.includes(n);
+              });
+
+            if (!match) return;
+
+            const originalQty = match.quantity;
+            const newQty      = Math.max(0, originalQty - quantity);
+            const itemId      = (match as unknown as Record<string, unknown>).itemId as string | undefined ?? "";
+
+            const revertInfo: NonNullable<WfmWhisper["revertInfo"]> = {
+              orderId: match.id,
+              itemId,
+              platinum: match.platinum,
+              originalQty,
+              newQty,
+              visible: match.visible,
+            };
+
+            if (newQty > 0) {
+              await invokeWfm("wfm_update_order", { orderId: match.id, platinum: match.platinum, quantity: newQty, visible: match.visible });
+            } else {
+              await invokeWfm("wfm_delete_order", { orderId: match.id });
+            }
+
+            // Phase 2 state update: attach revertInfo to the ghost
+            setWhispers(prev => {
+              const idx = prev.findIndex(
+                w => w.completedAt && w.from === (matchedFrom ?? withPlayer) && !w.revertInfo
+              );
+              if (idx === -1) return prev;
+              const updated = [...prev];
+              updated[idx] = { ...updated[idx], revertInfo };
+              return updated;
+            });
+          } catch (err) {
+            console.warn("[trade-completed] WFM order update failed:", err);
+          }
+        })();
+      }
+    });
+    return () => { unlisten.then(fn => fn()); };
+  }, []); // eslint-disable-line
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -300,6 +417,30 @@ function MessagesPanel({ username: _username }: { username: string }) {
     setWhispers(prev => prev.filter(w => w.from !== from));
   };
 
+  const revertOrder = async (w: WfmWhisper, idx: number) => {
+    if (!w.revertInfo) return;
+    const { orderId, itemId, platinum, originalQty, newQty, visible } = w.revertInfo;
+    setReverting(idx);
+    try {
+      if (newQty > 0) {
+        // We reduced qty → restore to original
+        await invokeWfm("wfm_update_order", { orderId, platinum, quantity: originalQty, visible });
+      } else {
+        // We deleted the listing → re-create it
+        await invokeWfm("wfm_create_order", { itemId, orderType: "sell", platinum, quantity: originalQty });
+      }
+      // Clear revertInfo after a successful revert so the button disappears
+      setWhispers(prev => {
+        const updated = [...prev];
+        if (updated[idx]) updated[idx] = { ...updated[idx], revertInfo: undefined };
+        return updated;
+      });
+    } catch (err) {
+      console.error("[revert] failed:", err);
+    }
+    setReverting(null);
+  };
+
   return (
     <div className="wfm-panel">
       {whispers.length === 0 ? (
@@ -313,28 +454,49 @@ function MessagesPanel({ username: _username }: { username: string }) {
         <>
           <button className="wfm-clear-btn" onClick={() => setWhispers([])}>Clear all</button>
           {whispers.map((w, i) => (
-            <div key={i} className="wfm-whisper">
+            <div key={i} className={`wfm-whisper${w.completedAt ? " wfm-whisper-ghost" : ""}`}>
               <div className="wfm-whisper-header">
                 <span className="wfm-whisper-from">{w.from}</span>
                 <span className="wfm-whisper-time">{w.timestamp}</span>
               </div>
+              {w.completedAt && (
+                <div className="wfm-whisper-ghost-badge">✓ Completed in-game · auto-closing in 5 min</div>
+              )}
               {w.item && (
                 <div className="wfm-whisper-summary">
                   Wants: <span className="wfm-whisper-item">{w.item}</span>
                   {w.price && <span className="wfm-whisper-price"> · {fmt(w.price)}p</span>}
                 </div>
               )}
-              <div className="wfm-whisper-actions">
-                <button className="wfm-btn-sm wfm-btn-invite" onClick={() => copyInvite(w.from)}>
-                  {copied === w.from ? "✓ Copied!" : "📋 Copy invite"}
-                </button>
-                <button className="wfm-btn-sm wfm-btn-sold" onClick={() => copySold(w.from, w.item, w.price)}>
-                  ✓ Sold
-                </button>
-                <button className="wfm-btn-sm" onClick={() => setWhispers(prev => prev.filter((_, j) => j !== i))}>
-                  Ignore
-                </button>
-              </div>
+              {!w.completedAt && (
+                <div className="wfm-whisper-actions">
+                  <button className="wfm-btn-sm wfm-btn-invite" onClick={() => copyInvite(w.from)}>
+                    {copied === w.from ? "✓ Copied!" : "📋 Copy invite"}
+                  </button>
+                  <button className="wfm-btn-sm wfm-btn-sold" onClick={() => copySold(w.from, w.item, w.price)}>
+                    ✓ Sold
+                  </button>
+                  <button className="wfm-btn-sm" onClick={() => setWhispers(prev => prev.filter((_, j) => j !== i))}>
+                    Ignore
+                  </button>
+                </div>
+              )}
+              {w.completedAt && w.revertInfo && (
+                <div className="wfm-whisper-revert">
+                  <span className="wfm-revert-hint">
+                    {w.revertInfo.newQty > 0
+                      ? `WFM qty: ${w.revertInfo.originalQty} → ${w.revertInfo.newQty}`
+                      : `WFM listing deleted (was ×${w.revertInfo.originalQty})`}
+                  </span>
+                  <button
+                    className="wfm-btn-sm wfm-btn-revert"
+                    disabled={reverting === i}
+                    onClick={() => revertOrder(w, i)}
+                  >
+                    {reverting === i ? "Reverting…" : "↺ Revert"}
+                  </button>
+                </div>
+              )}
             </div>
           ))}
           <div ref={bottomRef} />
@@ -354,11 +516,25 @@ export default function WfmTrading({ wfmLookup: _wfmLookup, wfmItems, imageMap, 
   const [wfmStatus, setWfmStatus]       = useState<"online" | "ingame" | "invisible" | "offline">("offline");
   const [statusBusy, setStatusBusy]     = useState(false);
   const [statusError, setStatusError]   = useState("");
+  // The status the user actually wants — used to auto-reapply when WFM drops us to offline
+  const targetStatusRef  = useRef<"online" | "ingame" | "invisible" | null>(null);
+  const reconnectingRef  = useRef(false);
 
   const syncStatus = () => {
     invoke<string>("wfm_fetch_status")
-      .then(s => {
-        if (s === "online" || s === "ingame" || s === "invisible" || s === "offline") {
+      .then(async (s) => {
+        if (s !== "online" && s !== "ingame" && s !== "invisible" && s !== "offline") return;
+        if (s === "offline" && targetStatusRef.current && !reconnectingRef.current) {
+          // WFM dropped our status — silently reapply the last known target
+          reconnectingRef.current = true;
+          try {
+            await invoke("wfm_set_status", { status: targetStatusRef.current });
+            setWfmStatus(targetStatusRef.current);
+          } catch {
+            setWfmStatus("offline");
+          }
+          reconnectingRef.current = false;
+        } else {
           setWfmStatus(s);
         }
       })
@@ -392,10 +568,12 @@ export default function WfmTrading({ wfmLookup: _wfmLookup, wfmItems, imageMap, 
           const cachedStatus = existing[1] as "online" | "ingame" | "invisible" | "offline";
           if (cachedStatus === "online" || cachedStatus === "ingame" || cachedStatus === "invisible") {
             setWfmStatus(cachedStatus);
+            targetStatusRef.current = cachedStatus;
           }
         } else {
           // Fresh session start — default to invisible so the user controls when they appear.
           setWfmStatus("invisible");
+          targetStatusRef.current = "invisible";
           invoke("wfm_set_status", { status: "invisible" }).catch(() => {});
         }
       }
@@ -403,10 +581,10 @@ export default function WfmTrading({ wfmLookup: _wfmLookup, wfmItems, imageMap, 
     })();
   }, []); // eslint-disable-line
 
-  // Re-sync status every 5 minutes — WFM can reset it to offline after inactivity
+  // Poll every 2 minutes — WFM can drop status to offline; syncStatus auto-reapplies
   useEffect(() => {
     if (!username) return;
-    const id = setInterval(syncStatus, 5 * 60 * 1000);
+    const id = setInterval(syncStatus, 2 * 60 * 1000);
     return () => clearInterval(id);
   }, [username]); // eslint-disable-line
 
@@ -449,7 +627,7 @@ export default function WfmTrading({ wfmLookup: _wfmLookup, wfmItems, imageMap, 
         <div className="wfm-session-info">
           <div className="wfm-status-picker"
             title={wfmStatus === "offline"
-              ? "WFM set you offline — click a dot to reconnect"
+              ? "WFM set you offline — reconnecting automatically, or click a dot to force"
               : `Status: ${wfmStatus}. Click to change.`}>
             {(["online", "ingame", "invisible"] as const).map(s => (
               <button key={s} disabled={statusBusy}
@@ -460,6 +638,7 @@ export default function WfmTrading({ wfmLookup: _wfmLookup, wfmItems, imageMap, 
                   try {
                     await invoke("wfm_set_status", { status: s });
                     setWfmStatus(s);
+                    targetStatusRef.current = s;
                   } catch (e) { setStatusError(String(e)); }
                   setStatusBusy(false);
                 }}>●</button>
@@ -478,7 +657,7 @@ export default function WfmTrading({ wfmLookup: _wfmLookup, wfmItems, imageMap, 
 
       {tab === "listings"
         ? <ListingsPanel username={username} itemIdMap={new Map(wfmItems.map(i => [i.id, i.item_name]))} wfmItems={wfmItems} imageMap={imageMap} />
-        : <MessagesPanel username={username} />
+        : <MessagesPanel username={username} wfmItems={wfmItems} />
       }
     </div>
   );

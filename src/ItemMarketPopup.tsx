@@ -94,7 +94,20 @@ function StatusDot({ status }: { status: string }) {
   return <span className={`imp-status-dot ${cls}`} title={label} />;
 }
 
-function OrderRow({ o, type, onList }: { o: WfmOrder; type: "sell" | "buy"; onList?: (price: number) => void }) {
+function OrderRow({ o, type, displayName, onList }: {
+  o: WfmOrder; type: "sell" | "buy"; displayName?: string; onList?: (price: number) => void;
+}) {
+  const [copied, setCopied] = useState(false);
+
+  const copyWhisper = () => {
+    const action = type === "sell" ? "buy" : "sell";
+    const msg = `/w ${o.user.ingameName} Hi! I want to ${action}: "${displayName}" for ${o.platinum} platinum. (warframe.market)`;
+    navigator.clipboard.writeText(msg).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  };
+
   return (
     <div className={`imp-order-row imp-order-${type}${o.user.status === "offline" ? " imp-order-offline" : ""}`}>
       <span className="imp-order-price">{fmt(o.platinum)}p</span>
@@ -102,6 +115,15 @@ function OrderRow({ o, type, onList }: { o: WfmOrder; type: "sell" | "buy"; onLi
       <StatusDot status={o.user.status} />
       <span className="imp-order-user">{o.user.ingameName}</span>
       {o.mod_rank !== undefined && <span className="imp-order-rank">r{o.mod_rank}</span>}
+      {displayName && (
+        <button
+          className={`imp-copy-btn${copied ? " imp-copy-btn-done" : ""}`}
+          onClick={copyWhisper}
+          title={`/w ${o.user.ingameName} Hi! I want to buy: "${displayName}" for ${o.platinum} platinum. (warframe.market)`}
+        >
+          {copied ? "✓" : "📋"}
+        </button>
+      )}
       {onList && (
         <button className="imp-list-btn" onClick={() => onList(o.platinum)} title="List at this price">
           {type === "sell" ? "↓ Match" : "↑ Match"}
@@ -224,14 +246,14 @@ export default function ItemMarketPopup({ urlName, displayName, imageName, onClo
           {/* Sell column */}
           <div className="imp-col">
             <div className="imp-col-header">
-              <span>Sell orders</span>
-              {lowestSell && <span className="imp-col-best">Lowest: {fmt(lowestSell)}p</span>}
+              <span>Sellers <span className="imp-col-sub">you buy from</span></span>
+              {lowestSell && <span className="imp-col-best">Cheapest: {fmt(lowestSell)}p</span>}
             </div>
             {loadingO ? <div className="imp-loading">Loading…</div> :
              ordersError ? <div className="imp-none" style={{ color: "var(--red)", padding: "8px 10px", fontSize: 11 }}>{ordersError}</div> :
              !orders?.sell.length ? <div className="imp-none">No sellers found</div> :
              orders.sell.map((o, i) => (
-               <OrderRow key={i} o={o} type="sell"
+               <OrderRow key={i} o={o} type="sell" displayName={displayName}
                  onList={isLoggedIn ? (p) => openForm("sell", p) : undefined} />
              ))
             }
@@ -240,14 +262,14 @@ export default function ItemMarketPopup({ urlName, displayName, imageName, onClo
           {/* Buy column */}
           <div className="imp-col">
             <div className="imp-col-header">
-              <span>Buy orders</span>
-              {highestBuy && <span className="imp-col-best">Highest: {fmt(highestBuy)}p</span>}
+              <span>Buyers <span className="imp-col-sub">you sell to</span></span>
+              {highestBuy && <span className="imp-col-best">Best offer: {fmt(highestBuy)}p</span>}
             </div>
             {loadingO ? <div className="imp-loading">Loading…</div> :
              ordersError ? <div className="imp-none">—</div> :
              !orders?.buy.length ? <div className="imp-none">No buyers found</div> :
              orders.buy.map((o, i) => (
-               <OrderRow key={i} o={o} type="buy"
+               <OrderRow key={i} o={o} type="buy" displayName={displayName}
                  onList={isLoggedIn ? (p) => openForm("buy", p) : undefined} />
              ))
             }

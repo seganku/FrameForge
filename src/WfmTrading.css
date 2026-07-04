@@ -581,6 +581,40 @@
 .wfm-whisper-item { color: var(--text); font-weight: 600; }
 .wfm-whisper-price { color: #f0c040; }
 
+.wfm-whisper-ghost {
+  border-color: rgba(80, 200, 80, 0.35);
+  background: rgba(80, 200, 80, 0.05);
+  opacity: 0.75;
+}
+
+.wfm-whisper-ghost-badge {
+  font-size: 11px;
+  color: var(--green);
+  font-weight: 600;
+}
+
+.wfm-whisper-revert {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.wfm-revert-hint {
+  font-size: 11px;
+  color: var(--muted);
+  flex: 1;
+}
+
+.wfm-btn-revert {
+  border-color: rgba(80, 200, 80, 0.45) !important;
+  color: var(--green) !important;
+}
+.wfm-btn-revert:hover:not(:disabled) {
+  background: rgba(80, 200, 80, 0.12) !important;
+}
+.wfm-btn-revert:disabled { opacity: 0.5; cursor: default; }
+
 .wfm-whisper-actions {
   display: flex;
   gap: 5px;

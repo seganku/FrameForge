@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+﻿use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -80,6 +80,9 @@ pub struct AppState {
     pub api_quantities_cache: Arc<Mutex<HashMap<String, i64>>>,
     /// Companion API mod copies held in memory so the scanner includes them in cache writes.
     pub api_mod_copies_cache: Arc<Mutex<Vec<ApiModCopy>>>,
+    /// Most recent OCR frame (top ~48% of Warframe window, BGRA, width, height).
+    /// Stored by the OCR loop so auto-capture can write it without a second GPU readback.
+    pub last_ocr_frame: Arc<Mutex<Option<(Vec<u8>, u32, u32)>>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -2354,14 +2357,24 @@ fn start_log_watcher(app: tauri::AppHandle) -> Result<(), String> {
                     let parse_plat = |s: &str| -> i64 { s.find("Platinum x ").and_then(|i| s[i+11..].split(|c: char| !c.is_ascii_digit()).next()).and_then(|n| n.parse().ok()).unwrap_or(0) };
                     let plat_off = parse_plat(&offered);
                     let plat_rec = parse_plat(&received);
-                    let (direction, item_name, platinum) = if plat_off > 0 {
+                    let (direction, raw_item, platinum) = if plat_off > 0 {
                         ("bought", received.lines().find(|l| !l.trim().is_empty() && !l.to_lowercase().contains("platinum")).map(|l| l.trim().to_string()).unwrap_or_default(), plat_off)
                     } else {
                         ("sold", offered.lines().find(|l| !l.trim().is_empty() && !l.to_lowercase().contains("platinum")).map(|l| l.trim().to_string()).unwrap_or_default(), plat_rec)
                     };
+                    // Parse "Item Name x 50" → item_name="Item Name", quantity=50
+                    let (item_name, quantity) = if let Some(x_pos) = raw_item.rfind(" x ") {
+                        let qty_str = raw_item[x_pos + 3..].trim();
+                        match qty_str.parse::<i64>() {
+                            Ok(n) => (raw_item[..x_pos].trim().to_string(), n),
+                            Err(_) => (raw_item, 1i64),
+                        }
+                    } else {
+                        (raw_item, 1i64)
+                    };
                     let _ = app.emit("trade-completed", serde_json::json!({
                         "withPlayer": with_player, "direction": direction,
-                        "itemName": item_name, "quantity": 1, "platinum": platinum,
+                        "itemName": item_name, "quantity": quantity, "platinum": platinum,
                         "timestamp": chrono::Utc::now().to_rfc3339(),
                     }));
                 }
@@ -3361,6 +3374,12 @@ pub struct CraftingJob {
 }
 
 #[derive(serde::Serialize, Clone)]
+pub struct BlobStatusPayload {
+    pub stage:   String,  // "scanning" | "done" | "error"
+    pub detail:  String,  // human-readable detail
+}
+
+#[derive(serde::Serialize, Clone)]
 pub struct InventoryUpdate {
     pub quantities: HashMap<String, i64>,
     pub crafting: Vec<CraftingJob>,
@@ -3407,19 +3426,6 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
         unique_names.push(path.to_string());
         display_names.push(name.to_string());
     }
-    // Truly-assembled items only (not parts/blueprints) — used to build the scanner's
-    // unique_path_set so component parts at /Lotus/Weapons/ paths are NOT skipped by
-    // Scanner 1 (e.g. "Paris Prime String" lives at /Lotus/Weapons/... but is a Part).
-    let assembled_names: Vec<String> = items.iter()
-        .filter(|i| {
-            let cat = fix_category(&i.name, &i.category, &i.unique_name);
-            // Skins and Railjack cosmetics are stored in RawUpgrades (mod scanner handles them).
-            // Parts/Blueprints/Mods/Arcanes never appear as unique binary-owned items.
-            if matches!(cat.as_str(), "Parts" | "Blueprints" | "Mods" | "Arcanes" | "Skins" | "Railjack") { return false; }
-            is_unique_path(&i.unique_name)
-        })
-        .map(|i| i.unique_name.clone())
-        .collect();
     // Items that share a game path with a canonical counterpart (dual-body warframes,
     // renamed items, etc.).  Map  secondary_path → primary_path.
     // The scanner searches for ALL paths, but stores results under the primary so the
@@ -3472,18 +3478,17 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
 
     let flag = state.monitor_active.clone();
     let db_path = state.db_path.clone();
-    let log_path = state.log_path.clone();
-    let changes_log_path = state.changes_log_path.clone();
     let inventory_state_cache_path = state.inventory_state_cache_path.clone();
     let shared_quantities    = state.current_quantities.clone();
     let shared_unique        = state.unique_quantities.clone();
     let shared_mods          = state.current_mods.clone();
     let shared_crafting      = state.current_crafting.clone();
-    let shared_api_quantities = state.api_quantities_cache.clone();
-    let shared_api_mod_copies = state.api_mod_copies_cache.clone();
     let blob_log_enabled     = state.blob_log_enabled.clone();
     let blob_log_dir         = state.blob_log_dir.clone();
     let reward_app = app.clone();  // clone before app is moved into the inventory thread
+
+    // Channel for the blob capture thread to deliver a parsed BlobInventory to the monitor loop.
+    let (blob_tx, blob_rx) = std::sync::mpsc::channel::<memory_scanner::BlobInventory>();
 
     std::thread::spawn(move || {
         let conn = match rusqlite::Connection::open(&db_path) {
@@ -3502,16 +3507,13 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
 
         // Pre-populate known with cached resource quantities so that per-cycle hint
         // emits never replace the frontend display with a partial inventory.
-        // Without this, the first hint-based emit only has ~1164 items and the
-        // frontend's setQuantities replaces everything, dropping all other cached items.
         // Only non-unique, non-mod paths (resources, relics, blueprints, etc.).
         for (path, item) in &startup_cache.items {
             if item.amount > 0 && item.mod_ranks.is_none() && !is_unique_path(path) {
                 known.entry(path.clone()).or_insert(item.amount as i64);
             }
         }
-        // Keep shared_quantities in sync so the cache-clear detector (which checks
-        // sq.is_empty() && known_was_populated) doesn't misfire on the very first cycle.
+        // Keep shared_quantities in sync so the cache-clear detector doesn't misfire.
         {
             let mut q = shared_quantities.lock().unwrap_or_else(|e| e.into_inner());
             if q.is_empty() && !known.is_empty() { *q = known.clone(); }
@@ -3519,23 +3521,37 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
 
         // Stability buffer for unique scanner items (weapons/warframes).
         // Pre-seed confirmed items at count=4 so they show immediately on restart.
-        // Exclude subsumed warframes — they no longer appear in the Suits array and
-        // would show as owned when in fact the frame was consumed by Helminth.
         let mut unique_stable: HashMap<String, u8> = startup_cache.items.iter()
             .filter(|(k, v)| v.mod_ranks.is_none() && v.amount > 0 && !v.subsumed && is_unique_path(k))
             .map(|(k, _)| (k.clone(), 4u8))
             .collect();
-        // Items that have been confirmed (count reached 2 at least once).
-        // An item stays confirmed — and stays visible — until fully pruned (count reaches 0).
-        // This prevents a single missed pass from causing a visible flicker for stable items.
         let mut confirmed_unique: std::collections::HashSet<String> =
             unique_stable.keys().cloned().collect();
 
         // Mods: commit hint results directly on every partial pass.
         // The hint is the live inventory-root region and is always authoritative.
         // No stability buffer needed — wrong counts on a bad scan self-correct next pass.
-        let mut known_mods: HashMap<String, memory_scanner::ModCount> =
-            shared_mods.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        // Pre-seed from startup cache so mods/arcanes show immediately on restart instead
+        // of going blank until the hint scan rediscovers the RawUpgrades region.
+        let mut known_mods: HashMap<String, memory_scanner::ModCount> = {
+            let from_shared = shared_mods.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if !from_shared.is_empty() {
+                from_shared
+            } else {
+                startup_cache.items.iter()
+                    .filter(|(_, v)| v.mod_ranks.is_some())
+                    .map(|(path, v)| {
+                        let by_rank: HashMap<u8, i64> = v.mod_ranks.as_ref()
+                            .map(|ranks| ranks.iter()
+                                .filter_map(|(r, &c)| r.parse::<u8>().ok().map(|rank| (rank, c)))
+                                .collect())
+                            .unwrap_or_default();
+                        let total = by_rank.values().sum();
+                        (path.clone(), memory_scanner::ModCount { total, by_rank })
+                    })
+                    .collect()
+            }
+        };
         // Track the last date we recorded daily snapshots (YYYY-MM-DD).
         // Initialise to yesterday so the first scan of a new day always fires.
         let mut last_snapshot_date = String::new();
@@ -3569,667 +3585,190 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
             });
         }
 
-        // Rolling scan state: resume_addr carries over between windows so the
-        // scanner continues from where it left off instead of restarting each time.
-        let mut resume_addr: usize = 0;
-        // Pinned hot addresses: chunk bases where inventory JSON was last found.
-        // Passed to each scan window so the scanner checks them first (~instant)
-        // before continuing the rolling walk of all 17k+ regions.
-        // Persisted to disk so the next launch finds inventory immediately without
-        // waiting for a full rolling pass to rediscover the address.
-        let hints_path = log_path.with_file_name("inventory_hints.json");
-        let mut inventory_hints: Vec<usize> = std::fs::read_to_string(&hints_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Vec<u64>>(&s).ok())
-            .map(|v| v.into_iter().map(|a| a as usize).collect())
-            .unwrap_or_default();
-        if !inventory_hints.is_empty() {
-            eprintln!("[monitor] loaded {} inventory hint(s) from disk", inventory_hints.len());
-        }
-        // RawUpgrades chunk addresses — discovered by the full scan when gameplay mods are
-        // found outside the MiscItems chunk. Persisted across scans for the hint fast-path.
-        let mod_hints_path = log_path.with_file_name("mod_hints.json");
-        let mut mod_inventory_hints: Vec<usize> = std::fs::read_to_string(&mod_hints_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Vec<u64>>(&s).ok())
-            .map(|v| v.into_iter().map(|a| a as usize).collect())
-            .unwrap_or_default();
-        if !mod_inventory_hints.is_empty() {
-            eprintln!("[monitor] loaded {} mod hint(s) from disk", mod_inventory_hints.len());
-        }
-        // Blob logging: once per full pass when blob_log_enabled is true.
-        let mut blob_saved_this_pass = false;
-
-        // Accumulated data for the current full pass (reset when resume_addr wraps to 0).
-        // mastery_data and consumed_suits are pre-seeded from cache — they don't change often
-        // and the scanner will overwrite with fresh data once it finds them.
-        let mut pass_log_lines: Vec<String> = Vec::new();
-        let mut pass_regions:   usize = 0;
-        let mut pass_mastery_rank: Option<u32> = startup_cache.mastery_rank;
-        let mut pass_mastery_data: HashMap<String, u32> = startup_cache.items.iter()
+        let mut current_mastery_rank: Option<u32> = startup_cache.mastery_rank;
+        let mut current_mastery_data: HashMap<String, u32> = startup_cache.items.iter()
             .filter(|(_, v)| v.mastery_rank > 0)
             .map(|(k, v)| (k.clone(), v.mastery_rank))
             .collect();
-        let mut pass_recipes: Vec<memory_scanner::PendingRecipe> = Vec::new();
-        let mut pass_unique_seen: HashMap<String, ()> = HashMap::new();
-        // Per-pass resource accumulator: (min_count_seen, max_count_seen, item_name).
-        // Tracking both min and max lets us detect when stale memory copies have disappeared:
-        // min == max means every region in the pass agreed on the same count (no stale copies).
-        let mut pass_resource_counts: HashMap<String, (i64, i64, String)> = HashMap::new();
-        // Stability buffer for resource count changes: (candidate_count, consecutive_passes).
-        // A count change is only committed once it appears consistently for enough passes.
-        // Gains (count up) require 1 pass; decreases require 2 to filter stale sell copies.
-        let mut pending_resources: HashMap<String, (i64, u8)> = HashMap::new();
-        // MiscItems counts from the hint region this pass. Used for fast-commit of count changes.
-        let mut pass_hint_resources: HashMap<String, i64> = HashMap::new();
-        // Tracks whether this pass found the actual account inventory blob.
-        // True when any window detected "Created":{"$date": (inventory root) or the hint
-        // successfully read MiscItems (both indicate the real inventory is in memory).
-        let mut pass_found_actual_inventory = false;
-        // Monotonically increasing counter — incremented each full pass where
-        // pass_found_actual_inventory was true. Used to detect multi-pass absences.
-        let mut actual_inv_count: u32 = 0;
-        // Item path → actual_inv_count when last seen. Items absent for 2+ consecutive
-        // actual inventory passes are zeroed (resources) or removed (unique items).
-        let mut item_last_actual_scan: HashMap<String, u32> = HashMap::new();
-        let mut unique_last_actual_scan: HashMap<String, u32> = HashMap::new();
-        // Paths ever added via FlavourItems scan. Persists across passes so the resource
-        // scanner cannot overwrite their counts (e.g. cosmetics that appear in shop/market
-        // data with large fake ItemCount values).
-        // Pre-seeded from the cache so the vanish check doesn't zero them before the first
-        // hint scan completes on restart.
-        let mut known_flavour_paths: std::collections::HashSet<String> =
-            startup_cache.items.iter()
-                .filter(|(_, v)| v.is_flavour)
-                .map(|(k, _)| k.clone())
-                .collect();
-        // FlavourItems (glyphs, titles, emotes) from the hint region this pass.
-        let mut pass_hint_flavour: HashMap<String, i64> = HashMap::new();
-        let mut flavour_scanned_this_pass = false;
-        // Consumed suits persist across passes — subsumption is permanent, never un-subsumed.
-        let mut pass_consumed_suits: Vec<String> = startup_cache.consumed_suits();
-        // Socketed shards: pre-seeded from cache so they appear immediately on launch.
-        let mut pass_socketed_shards: HashMap<String, Vec<memory_scanner::ArchonShard>> = startup_cache.items.iter()
+        let mut current_recipes: Vec<memory_scanner::PendingRecipe> = Vec::new();
+        let mut current_consumed_suits: Vec<String> = startup_cache.consumed_suits();
+        let mut current_socketed_shards: HashMap<String, Vec<memory_scanner::ArchonShard>> = startup_cache.items.iter()
             .filter(|(_, v)| !v.archon_shards.is_empty())
             .map(|(k, v)| (k.clone(), v.archon_shards.clone()))
             .collect();
+        let mut last_blob_time: Option<std::time::Instant> = None;
 
         while flag.load(Ordering::SeqCst) {
-            // If the user cleared the cache, shared_quantities will be empty while our
-            // local state still holds stale data. Wipe ALL local inventory state so the
-            // next scan treats every item as a fresh gain (with change log entries) and
-            // the immediate emit after a not-running scan doesn't re-populate the UI.
-            // Guard with any-non-empty check so this never fires on first start when both
-            // known and shared_quantities are legitimately empty.
+            // If shared_quantities was cleared externally (clear_cache command), wipe local
+            // state so the next blob logs everything as fresh.
             {
                 let sq = shared_quantities.lock().unwrap_or_else(|e| e.into_inner());
-                let local_has_data = !known.is_empty()
-                    || !unique_stable.is_empty()
-                    || !known_mods.is_empty();
+                let local_has_data = !known.is_empty() || !unique_stable.is_empty() || !known_mods.is_empty();
                 if sq.is_empty() && local_has_data {
                     known.clear();
                     unique_stable.clear();
                     confirmed_unique.clear();
                     known_mods.clear();
-                    known_flavour_paths.clear();
-                    item_last_actual_scan.clear();
-                    unique_last_actual_scan.clear();
-                    actual_inv_count = 0;
-                    resume_addr = 0;
                 }
             }
 
-            // 15-second window — small enough to find inventory quickly,
-            // large enough to cover meaningful memory without thrashing.
-            let result = memory_scanner::scan_warframe_memory(
-                &unique_names, &display_names, &assembled_names,
-                resume_addr,
-                15,
-                &inventory_hints,
-                &mod_inventory_hints,
-            );
             let now = chrono::Utc::now().timestamp();
 
-            eprintln!("[monitor] w={} rgn={} items={} err={:?} next=0x{:x}",
-                result.warframe_running, result.regions_scanned,
-                result.items_found.len(), result.error, result.resume_addr);
-            for line in &result.log_lines {
-                eprintln!("  {}", line);
-            }
+            // Process any incoming blob (non-blocking)
+            while let Ok(blob) = blob_rx.try_recv() {
+                let existing_wfm: HashMap<String, u32> =
+                    load_inventory_state_cache(&inventory_state_cache_path)
+                        .items.into_iter()
+                        .filter_map(|(k, v)| v.wfm_price.map(|p| (k, p)))
+                        .collect();
+                let sc = build_inventory_from_blob(
+                    &blob,
+                    &path_to_name, &path_to_category, &path_to_ducat, &path_to_vaulted,
+                    &relic_drops_snapshot, &existing_wfm, &alias_excluded,
+                );
+                if let Ok(json) = serde_json::to_string(&sc) {
+                    let _ = atomic_write(&inventory_state_cache_path, json.as_bytes());
+                }
 
-            // Write per-window entry to scan_log (append), so it's never empty.
-            {
-                let now_str = chrono::DateTime::from_timestamp(now, 0)
-                    .map(|dt: chrono::DateTime<chrono::Utc>| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                    .unwrap_or_else(|| now.to_string());
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-                    let _ = writeln!(f, "[{}] rgn={} items={} next=0x{:x}",
-                        now_str, result.regions_scanned, result.items_found.len(), result.resume_addr);
-                    for line in &result.log_lines {
-                        let _ = writeln!(f, "  {}", line);
-                    }
-                }
-            }
+                // Snapshot previous full inventory (known + uniques + mods) for change detection.
+                let prev_all: HashMap<String, i64> = {
+                    let mut m = known.clone();
+                    for k in &confirmed_unique { m.entry(k.clone()).or_insert(1); }
+                    for (p, mc) in &known_mods { m.entry(p.clone()).or_insert(mc.total); }
+                    m
+                };
 
-            if !result.warframe_running {
-                // Game not running — reset rolling state and sleep before retrying.
-                // Do NOT clear inventory_hints — stale addresses are validated by the
-                // fast-path VirtualQuery check, and may still be valid when game restarts.
-                resume_addr = 0;
-                pass_log_lines.clear(); pass_regions = 0;
-                // Keep mastery/mods/unique_stable/consumed_suits so the cached inventory
-                // stays visible in the UI while Warframe is not running. unique_stable will
-                // be properly pruned by retain() on the first full pass after relaunch.
-                pass_recipes.clear(); pass_unique_seen.clear();
-                // Do NOT clear pass_socketed_shards here — the end-of-pass emit overwrites
-                // stale entries by replacing the entire map with the freshly scanned set.
-                let mut emit_qty = known.clone();
-                for k in unique_stable.keys() { emit_qty.entry(k.clone()).or_insert(1); }
-                for (path, mc) in &known_mods { emit_qty.entry(path.clone()).or_insert(mc.total); }
-                let _ = app.emit("inventory-update", InventoryUpdate {
-                    quantities: emit_qty, crafting: vec![],
-                    mastery_rank: pass_mastery_rank,
-                    mastery_data: pass_mastery_data.clone(),
-                    changes: vec![], warframe_running: false, scanned_at: now,
-                    consumed_suits: pass_consumed_suits.clone(),
-                    mods: known_mods.clone(),
-                    socketed_shards: pass_socketed_shards.clone(),
-                    is_full_pass: false,
-                });
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                continue;
-            }
+                // Blob is authoritative — full replacement, not a merge.
+                // Clear known so items that disappeared from the blob drop to 0.
+                known.clear();
 
-            // Accumulate pass-level data.
-            pass_regions += result.regions_scanned;
-            pass_log_lines.extend(result.log_lines.iter().cloned());
-            if let Some(mr) = result.mastery_rank { pass_mastery_rank = Some(mr); }
-            for (k, v) in &result.mastery_data {
-                let e = pass_mastery_data.entry(k.clone()).or_insert(0);
-                if *v > *e { *e = *v; }
-            }
-            for r in &result.pending_recipes {
-                if !pass_recipes.iter().any(|p| p.unique_name == r.unique_name) {
-                    pass_recipes.push(r.clone());
-                }
-            }
-            for item in &result.items_found {
-                if !item.explicit_count {
-                    pass_unique_seen.insert(item.unique_name.clone(), ());
-                }
-            }
-            for suit in &result.consumed_suits {
-                if !pass_consumed_suits.contains(suit) {
-                    pass_consumed_suits.push(suit.clone());
-                }
-                // Helminth subsumption requires rank 30 — guarantee mastery for any
-                // subsumed warframe even if it was consumed before the XP scanner ran.
-                pass_mastery_data.entry(suit.clone()).or_insert(30);
-            }
-            for (wf_path, shards) in &result.socketed_shards {
-                if shards.is_empty() {
-                    // Empty vec is a "checked, no shards" marker from the scanner.
-                    // Remove any stale entry so the UI doesn't show phantom shards.
-                    pass_socketed_shards.remove(wf_path);
-                } else {
-                    // Always overwrite — shard loadouts are swappable in-game.
-                    pass_socketed_shards.insert(wf_path.clone(), shards.clone());
-                }
-            }
+                // Currency
+                known.insert("/_currency/Credits".to_string(),      blob.credits);
+                known.insert("/_currency/Endo".to_string(),         blob.endo);
+                known.insert("/_currency/Platinum".to_string(),     blob.platinum - blob.free_platinum);
+                known.insert("/_currency/PlatinumGift".to_string(), blob.free_platinum);
 
-            // Accumulate resource counts for end-of-pass commit.
-            // Warframe keeps stale pre-sell copies of inventory data in other memory regions
-            // alongside the real updated count. Committing mid-pass oscillates the changelog
-            // between the real count and the stale copy. Instead, track the minimum count
-            // seen for each path across all windows in this pass, then commit once at end.
-            let known_was_populated = !known.is_empty();
-            let mut changes: Vec<QuantityChange> = Vec::new();
-            for item in &result.items_found {
-                if !item.explicit_count { continue; }
-                let canon_name = path_aliases.get(item.unique_name.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| item.unique_name.clone());
-                let entry = pass_resource_counts
-                    .entry(canon_name)
-                    .or_insert_with(|| (item.quantity, item.quantity, item.name.clone()));
-                if item.quantity < entry.0 { entry.0 = item.quantity; }
-                if item.quantity > entry.1 { entry.1 = item.quantity; }
-            }
-            // Merge hint-region MiscItems resources for this window.
-            // The hint fires only when hot_addrs point to a live, non-mission-delta MiscItems
-            // region — this is the only reliable signal that the actual account inventory
-            // is in memory and readable. Do NOT set pass_found_actual_inventory from
-            // result.found_actual_inventory (the Created-key general scan flag): that region
-            // contains no MiscItems, so its presence alone doesn't confirm the full inventory
-            // is readable, and during missions an old Created region can still be found even
-            // after the live inventory blob has moved, which would trigger false zeroing.
-            if !result.hint_resources.is_empty() {
-                pass_found_actual_inventory = true;
-                for (path, &qty) in &result.hint_resources {
-                    let canon = path_aliases.get(path.as_str())
+                // Stackable items
+                for entry in &blob.stackable_items {
+                    known.insert(entry.item_type.clone(), entry.item_count);
+                }
+
+                // Unique items — full replacement (blob is authoritative)
+                unique_stable.clear();
+                confirmed_unique.clear();
+                current_socketed_shards.clear();
+                for entry in &blob.unique_items {
+                    let canonical = path_aliases.get(entry.item_type.as_str())
                         .map(|s| s.to_string())
-                        .unwrap_or_else(|| path.clone());
-                    pass_hint_resources.insert(canon, qty);
-                }
-
-                // Per-cycle hint commit: apply hint_resources to known immediately so
-                // the UI is populated without waiting for a full pass to complete.
-                // Gains commit after 1 consistent read; decreases require 2 to avoid
-                // committing stale partial-block reads (e.g. a smaller MiscItems at a
-                // lower address than the authoritative account inventory block).
-                for (path, &hint_qty) in &pass_hint_resources {
-                    let old_qty = *known.get(path).unwrap_or(&0);
-                    if hint_qty == old_qty { pending_resources.remove(path); continue; }
-
-                    let threshold = if hint_qty < old_qty { 2u8 } else { 1u8 };
-                    let entry = pending_resources.entry(path.clone()).or_insert((hint_qty, 0));
-                    if entry.0 != hint_qty { *entry = (hint_qty, 1); continue; }
-                    entry.1 += 1;
-                    if entry.1 < threshold { continue; }
-                    pending_resources.remove(path);
-
-                    let item_name = path_to_name.get(path)
-                        .cloned()
-                        .unwrap_or_else(|| path.split('/').last().unwrap_or("?").to_string());
-                    let change = QuantityChange {
-                        id: 0, unique_name: path.clone(), item_name: item_name.clone(),
-                        old_qty, new_qty: hint_qty, delta: hint_qty - old_qty, timestamp: now,
-                    };
-                    let _ = db::add_quantity_change(&conn, path, &item_name, old_qty, hint_qty);
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&changes_log_path) {
-                        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                        let _ = writeln!(f, "[{}] Memory Scanner | {} | {} → {} (hint-cycle)", ts, item_name, old_qty, hint_qty);
-                    }
-                    known.insert(path.clone(), hint_qty);
-                    changes.push(change);
-                }
-            }
-            // Merge hint-region FlavourItems (glyphs, titles, emotes) for this window.
-            if !result.hint_flavour_items.is_empty() {
-                flavour_scanned_this_pass = true;
-                for path in &result.hint_flavour_items {
-                    let canon = path_aliases.get(path.as_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| path.clone());
-                    pass_hint_flavour.insert(canon, 1);
-                }
-            }
-
-            // If clear_cache fired during this scan window, shared_quantities will be empty
-            // while known still holds stale data. Reset known and skip the emit so the next
-            // window starts fresh and records every item as a 0→N gain in the change log.
-            // Use known_was_populated (captured before the change-detection loop) so this
-            // check never fires on the very first scan when known starts empty and sq is also
-            // empty (no cache file) — that would permanently prevent the first emit.
-            {
-                let sq = shared_quantities.lock().unwrap_or_else(|e| e.into_inner());
-                if sq.is_empty() && known_was_populated {
-                    drop(sq);
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-                        let _ = writeln!(f, "  [CACHE-CLEAR] shared_quantities emptied during scan — resetting known and skipping emit");
-                    }
-                    known.clear();
-                    unique_stable.clear();
-                    known_mods.clear();
-                    resume_addr = 0;
-                    continue;
-                }
-            }
-
-            // Accumulate mods found in this partial pass into the full-pass accumulator.
-            // Stability is checked only at end-of-full-pass (resume_addr == 0) so that
-            // partial-pass totals (which vary because each partial covers different regions)
-            // never trigger false instability.
-            // Commit hint mods directly — hint is the live inventory root, always authoritative.
-            if !result.hint_mods.is_empty() {
-                known_mods = result.hint_mods.clone();
-                if let Ok(mut sm) = shared_mods.lock() { *sm = known_mods.clone(); }
-            }
-
-            // Emit immediately when this window found resource items or quantity changes.
-            if !result.items_found.is_empty() || !changes.is_empty() {
-                if let Ok(mut q) = shared_quantities.lock() { *q = known.clone(); }
-                // Persist inventory state on every resource/change event.
-                // Mod data (known_mods) is already up-to-date from the last full-pass stability check.
-                {
-                    let api_qty = shared_api_quantities.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    let api_mods = shared_api_mod_copies.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    let existing_wfm: HashMap<String, u32> = load_inventory_state_cache(&inventory_state_cache_path)
-                        .items.into_iter().filter_map(|(k, v)| v.wfm_price.map(|p| (k, p))).collect();
-                    let sc = build_inventory_cache(
-                        &known, &unique_stable, &known_mods,
-                        pass_mastery_rank, &pass_mastery_data,
-                        &pass_consumed_suits, &pass_socketed_shards,
-                        &path_to_name, &path_to_ducat, &path_to_vaulted, &path_to_category,
-                        &existing_wfm, &relic_drops_snapshot, api_qty, api_mods,
-                        &alias_excluded,
-                        &known_flavour_paths,
-                    );
-                    if let Ok(json) = serde_json::to_string(&sc) {
-                        let _ = atomic_write(&inventory_state_cache_path, json.as_bytes());
+                        .unwrap_or_else(|| entry.item_type.clone());
+                    if blob.consumed_suits.contains(&canonical) { continue; }
+                    unique_stable.insert(canonical.clone(), 4);
+                    confirmed_unique.insert(canonical.clone());
+                    if !entry.archon_shards.is_empty() {
+                        current_socketed_shards.insert(canonical, entry.archon_shards.clone());
                     }
                 }
-                let crafting: Vec<CraftingJob> = pass_recipes.iter().map(|r| {
-                    let name = display_names.iter().zip(unique_names.iter())
-                        .find(|(_, u)| *u == &r.unique_name)
-                        .map(|(d, _)| d.clone())
-                        .unwrap_or_else(|| r.unique_name.split('/').last().unwrap_or("?").to_string());
-                    CraftingJob { unique_name: r.unique_name.clone(), item_name: name, completion_ms: r.completion_ms }
-                }).collect();
-                *shared_crafting.lock().unwrap_or_else(|e| e.into_inner()) = crafting.clone();
-                let mut emit_qty = known.clone();
-                for name in &confirmed_unique {
-                    emit_qty.entry(name.clone()).or_insert(1);
-                }
-                // Include confirmed mod totals in quantities so the frontend
-                // inventory useMemo can find them via Object.keys(quantities).
-                for (path, mc) in &known_mods {
-                    emit_qty.entry(path.clone()).or_insert(mc.total);
-                }
-                let _ = app.emit("inventory-update", InventoryUpdate {
-                    quantities: emit_qty, crafting,
-                    mastery_rank: pass_mastery_rank,
-                    mastery_data: pass_mastery_data.clone(),
-                    changes, warframe_running: true, scanned_at: now,
-                    consumed_suits: pass_consumed_suits.clone(),
-                    mods: known_mods.clone(),
-                    socketed_shards: pass_socketed_shards.clone(),
-                    is_full_pass: false,
-                });
-            }
 
-            resume_addr = result.resume_addr;
-            // Update pinned addresses whenever the scanner finds (or re-confirms) the inventory root.
-            if !result.hot_addrs.is_empty() {
-                inventory_hints = result.hot_addrs.clone();
-                // Persist so the next app launch skips the slow first-pass rediscovery.
-                if let Ok(json) = serde_json::to_string(&inventory_hints.iter().map(|&a| a as u64).collect::<Vec<_>>()) {
-                    let _ = std::fs::write(&hints_path, json);
+                // Mods — full replacement
+                known_mods.clear();
+                for (path, mc) in &blob.mods {
+                    known_mods.insert(path.clone(), mc.clone());
                 }
-            }
-            // Update mod hint addresses from full-scan discoveries.
-            if !result.mod_hot_addrs.is_empty() {
-                for addr in &result.mod_hot_addrs {
-                    if !mod_inventory_hints.contains(addr) {
-                        mod_inventory_hints.push(*addr);
-                    }
-                }
-                if let Ok(json) = serde_json::to_string(&mod_inventory_hints.iter().map(|&a| a as u64).collect::<Vec<_>>()) {
-                    let _ = std::fs::write(&mod_hints_path, json);
-                }
-            }
-            if !result.hot_addrs.is_empty() {
-                // Auto-capture: save blobs once per full pass when enabled.
-                // Runs in a background thread — blob I/O must not block the scan loop.
-                if !blob_saved_this_pass && blob_log_enabled.load(Ordering::SeqCst) {
-                    blob_saved_this_pass = true;
-                    let ts  = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
-                    let dir = blob_log_dir.clone();
-                    std::thread::spawn(move || {
-                        let count = memory_scanner::capture_all_blobs(&dir, &ts);
-                        eprintln!("[monitor] {} blob(s) saved (ts={})", count, ts);
-                    });
-                }
-            } else if !inventory_hints.is_empty() && result.warframe_running {
-                // Had hints but hot path found nothing — inventory heap moved (common after
-                // returning from a mission). Force a full rescan from address 0 so the new
-                // location is found within the next 1–2 windows instead of waiting for the
-                // rolling scan to naturally wrap around (which can take 5–10 minutes).
-                eprintln!("[monitor] inventory hints lost — resetting scan to addr 0");
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-                    let _ = writeln!(f, "  [HINT-RESET] stale hints cleared — full rescan from addr 0");
-                }
-                inventory_hints.clear();
-                let _ = std::fs::remove_file(&hints_path);
-                resume_addr = 0;
-            }
 
-            // Full pass completed (scanner wrapped back to start of address space).
-            if resume_addr == 0 {
-                // Saturation counter: +1 per pass found (cap 4), -1 per pass missed (floor 0).
-                // Item is "owned" when count ≥ 1. Needs 4 consecutive misses to be pruned,
-                // so occasional scan misses don't cause owned items to flicker out of the UI.
-                let mut unique_changes: Vec<QuantityChange> = Vec::new();
-                for name in pass_unique_seen.keys() {
-                    // Resolve any alias to the canonical path before storing.
-                    let canonical = path_aliases.get(name.as_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| name.clone());
-                    // Never confirm a warframe that has been Helminth-subsumed.
-                    // Its path appears in squad JSON and stale memory but it is no longer owned.
-                    if pass_consumed_suits.contains(&canonical) { continue; }
-                    let e = unique_stable.entry(canonical.clone()).or_insert(0u8);
-                    if *e < 4 { *e += 1; }
-                    let just_confirmed = *e == 2 && !confirmed_unique.contains(&canonical);
-                    if just_confirmed {
-                        confirmed_unique.insert(canonical.clone());
-                        // Emit as 0→1 so new warframes/weapons appear in the changelog.
-                        let display = path_to_name.get(&canonical)
-                            .cloned()
-                            .unwrap_or_else(|| canonical.split('/').last().unwrap_or("?").to_string());
-                        let change = QuantityChange {
-                            id: 0, unique_name: canonical.clone(), item_name: display.clone(),
-                            old_qty: 0, new_qty: 1, delta: 1, timestamp: now,
-                        };
-                        let _ = db::add_quantity_change(&conn, &canonical, &display, 0, 1);
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&changes_log_path) {
-                            let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                            let _ = writeln!(f, "[{}] Memory Scanner | {} | 0 → 1 (unique confirmed)", ts, display);
-                        }
-                        unique_changes.push(change);
-                    } else if *e >= 2 {
-                        confirmed_unique.insert(canonical);
-                    }
+                // Cosmetics (FlavourItems + WeaponSkins) — occurrence-counted, go into known
+                for (path, &count) in blob.flavour_items.iter().chain(blob.weapon_skins.iter()) {
+                    known.insert(path.clone(), count);
                 }
-                unique_stable.retain(|k, v| {
-                    if !pass_unique_seen.contains_key(k) {
-                        // Only decrement items that haven't been confirmed yet (count < 2).
-                        // Confirmed unique items (warframes/weapons) are permanent — the game
-                        // only loads a subset into memory at any time, so a missed scan does
-                        // not mean the item was removed from the account. Declining to
-                        // decrement confirmed items prevents the "same weapon keeps appearing
-                        // as added" issue caused by items cycling in/out of memory.
-                        if *v < 2 && *v > 0 { *v -= 1; }
-                    }
-                    if *v == 0 { confirmed_unique.remove(k); }
-                    *v > 0
-                });
-                // Purge any subsumed warframes that slipped into confirmed_unique
-                // from a stale cache (before the subsumed flag was recorded).
-                for suit in &pass_consumed_suits {
+
+                // Meta
+                current_mastery_rank = Some(blob.mastery_level);
+                for (path, &rank) in &blob.mastery_data {
+                    current_mastery_data.insert(path.clone(), rank);
+                }
+                current_consumed_suits = blob.consumed_suits.clone();
+                for suit in &current_consumed_suits {
                     confirmed_unique.remove(suit);
                     unique_stable.remove(suit);
                 }
+                current_recipes = blob.pending_recipes.iter().map(|r| memory_scanner::PendingRecipe {
+                    unique_name:   r.item_type.clone(),
+                    completion_ms: r.completion_ms,
+                }).collect();
+
+                // Sync shared state
+                if let Ok(mut q)  = shared_quantities.lock() { *q = known.clone(); }
+                if let Ok(mut sm) = shared_mods.lock()       { *sm = known_mods.clone(); }
                 if let Ok(mut uq) = shared_unique.lock() {
                     uq.clear();
                     for name in &confirmed_unique { uq.insert(name.clone(), 1); }
                 }
 
-                let mut resource_changes: Vec<QuantityChange> = Vec::new();
+                // Emit inventory update
+                let mut emit_qty = known.clone();
+                for k in &confirmed_unique { emit_qty.entry(k.clone()).or_insert(1); }
+                for (p, mc) in &known_mods { emit_qty.entry(p.clone()).or_insert(mc.total); }
 
-                // ── Hint-based resource commit ────────────────────────────────────
-                // Uses the hint region (live MiscItems) to fast-commit count changes.
-                // Gains commit after 1 consistent read; decreases require 2 to filter
-                // stale copies that briefly show an older count after buffer reallocation.
-                for (path, &hint_qty) in &pass_hint_resources {
-                    let old_qty = *known.get(path).unwrap_or(&0);
-                    if hint_qty == old_qty { pending_resources.remove(path); continue; }
-
-                    let threshold = if hint_qty < old_qty { 2u8 } else { 1u8 };
-                    let entry = pending_resources.entry(path.clone()).or_insert((hint_qty, 0));
-                    if entry.0 != hint_qty {
-                        *entry = (hint_qty, 1);
-                        continue;
-                    }
-                    entry.1 += 1;
-                    if entry.1 < threshold { continue; }
-                    pending_resources.remove(path);
-
-                    let item_name = path_to_name.get(path)
-                        .cloned()
-                        .unwrap_or_else(|| path.split('/').last().unwrap_or("?").to_string());
-                    let change = QuantityChange {
-                        id: 0, unique_name: path.clone(), item_name: item_name.clone(),
-                        old_qty, new_qty: hint_qty, delta: hint_qty - old_qty, timestamp: now,
-                    };
-                    let _ = db::add_quantity_change(&conn, path, &item_name, old_qty, hint_qty);
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&changes_log_path) {
-                        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                        let _ = writeln!(f, "[{}] Memory Scanner | {} | {} → {} (hint)", ts, item_name, old_qty, hint_qty);
-                    }
-                    known.insert(path.clone(), hint_qty);
-                    resource_changes.push(change);
-                }
-
-                // ── FlavourItems commit ───────────────────────────────────────────
-                // Glyphs/emotes/palettes only live in FlavourItems (binary-owned, qty=1).
-                // Uses a 2-pass stability buffer before removal to survive stale hint regions
-                // returning smaller FlavourItems sets on occasional passes.
-                // known_flavour_paths blocks the resource scanner from writing wrong counts
-                // to these paths (cosmetics appear in shop/market data with fake ItemCounts).
-                if flavour_scanned_this_pass {
-                    for (path, &qty) in &pass_hint_flavour {
-                        known_flavour_paths.insert(path.clone());
-                        let old_qty = *known.get(path).unwrap_or(&0);
-                        if qty == old_qty { continue; }
-                        let item_name = path_to_name.get(path)
+                // Detect and record every quantity change (up, down, new, gone-to-0).
+                // Skip on the very first blob of the session (prev_all empty = no prior baseline).
+                let mut changes: Vec<QuantityChange> = vec![];
+                if !prev_all.is_empty() {
+                    let ts = chrono::Utc::now().timestamp();
+                    let all_keys: std::collections::HashSet<&String> =
+                        prev_all.keys().chain(emit_qty.keys()).collect();
+                    for key in all_keys {
+                        let old_qty = *prev_all.get(key).unwrap_or(&0);
+                        let new_qty = *emit_qty.get(key).unwrap_or(&0);
+                        if old_qty == new_qty { continue; }
+                        let item_name = path_to_name.get(key.as_str())
                             .cloned()
-                            .unwrap_or_else(|| path.split('/').last().unwrap_or("?").to_string());
-                        let change = QuantityChange {
-                            id: 0, unique_name: path.clone(), item_name: item_name.clone(),
-                            old_qty, new_qty: qty, delta: qty - old_qty, timestamp: now,
-                        };
-                        let _ = db::add_quantity_change(&conn, path, &item_name, old_qty, qty);
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&changes_log_path) {
-                            let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                            let _ = writeln!(f, "[{}] Memory Scanner | {} | {} → {} (flavour)", ts, item_name, old_qty, qty);
-                        }
-                        known.insert(path.clone(), qty);
-                        resource_changes.push(change);
-                    }
-                    // FlavourItems (glyphs, skins, emotes) are permanent unlocks in Warframe —
-                    // they cannot be sold or lost. scan_flavour_items only runs in the hint loop
-                    // which covers one memory region, so many owned items are absent every pass.
-                    // Never auto-remove: use Clear Cache to reset if needed.
-                }
-
-                // ── Full-scan commit (no hint, or items not seen by hint) ─────────
-                // min_qty / max_qty are the lowest and highest counts seen for this path
-                // across all scan windows in this pass.
-                //
-                // min == max: every memory region agreed — stale copies gone, commit immediately.
-                // min != max: stale sell copy present alongside the real count.
-                //             Park in pending_resources and wait for consensus:
-                //               decreases — candidate = min, need 2 passes
-                //               gains     — candidate = max, need 1 pass
-                for (path, (min_qty, max_qty, item_name)) in &pass_resource_counts {
-                    // Skip paths already committed from the hint scan this pass.
-                    if pass_hint_resources.contains_key(path.as_str()) { continue; }
-                    // Skip cosmetic paths — managed exclusively by FlavourItems commit above.
-                    if known_flavour_paths.contains(path.as_str()) { continue; }
-
-                    let old_qty = *known.get(path).unwrap_or(&0);
-
-                    if *min_qty == old_qty && *max_qty == old_qty {
-                        pending_resources.remove(path);
-                        continue;
-                    }
-
-                    let commit = |new_qty: i64,
-                                  known: &mut HashMap<String, i64>,
-                                  resource_changes: &mut Vec<QuantityChange>| {
-                        let change = QuantityChange {
-                            id: 0, unique_name: path.clone(), item_name: item_name.clone(),
-                            old_qty, new_qty, delta: new_qty - old_qty, timestamp: now,
-                        };
-                        let _ = db::add_quantity_change(&conn, path, item_name, old_qty, new_qty);
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&changes_log_path) {
-                            let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                            let _ = writeln!(f, "[{}] Memory Scanner | {} | {} → {}", ts, item_name, old_qty, new_qty);
-                        }
-                        known.insert(path.clone(), new_qty);
-                        resource_changes.push(change);
-                    };
-
-                    if min_qty == max_qty {
-                        pending_resources.remove(path);
-                        commit(*min_qty, &mut known, &mut resource_changes);
-                        continue;
-                    }
-
-                    let (candidate, threshold) = if *min_qty < old_qty {
-                        (*min_qty, 2u8)
-                    } else {
-                        (*max_qty, 1u8)
-                    };
-
-                    let entry = pending_resources.entry(path.clone()).or_insert((candidate, 0));
-                    if entry.0 != candidate { *entry = (candidate, 1); continue; }
-                    entry.1 += 1;
-                    if entry.1 < threshold { continue; }
-                    pending_resources.remove(path);
-                    commit(candidate, &mut known, &mut resource_changes);
-                }
-                // Prune pending entries for items that vanished from this pass entirely.
-                pending_resources.retain(|k, _| pass_resource_counts.contains_key(k.as_str()));
-
-                // Write full state cache after every complete pass — unique items are now
-                // fully evaluated (stability buffer settled), so this is the authoritative snapshot.
-                {
-                    let api_qty = shared_api_quantities.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    let api_mods = shared_api_mod_copies.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    let existing_wfm: HashMap<String, u32> = load_inventory_state_cache(&inventory_state_cache_path)
-                        .items.into_iter().filter_map(|(k, v)| v.wfm_price.map(|p| (k, p))).collect();
-                    let sc = build_inventory_cache(
-                        &known, &unique_stable, &known_mods,
-                        pass_mastery_rank, &pass_mastery_data,
-                        &pass_consumed_suits, &pass_socketed_shards,
-                        &path_to_name, &path_to_ducat, &path_to_vaulted, &path_to_category,
-                        &existing_wfm, &relic_drops_snapshot, api_qty, api_mods,
-                        &alias_excluded,
-                        &known_flavour_paths,
-                    );
-                    if let Ok(json) = serde_json::to_string(&sc) {
-                        let _ = atomic_write(&inventory_state_cache_path, json.as_bytes());
+                            .unwrap_or_else(|| key.split('/').last().unwrap_or("?").to_string());
+                        let _ = db::add_quantity_change(&conn, key, &item_name, old_qty, new_qty);
+                        changes.push(QuantityChange {
+                            id: 0,
+                            unique_name: key.clone(),
+                            item_name,
+                            old_qty,
+                            new_qty,
+                            delta: new_qty - old_qty,
+                            timestamp: ts,
+                        });
                     }
                 }
 
-                // Sync known → shared_quantities after every full-pass commit.
-                // During the pass, shared_quantities is only updated when a window
-                // finds items (before any commit), so it may still hold an empty
-                // snapshot from the very first window. Without this sync the
-                // cache-clear detector fires on the next iteration and wipes known,
-                // causing every item to be re-logged as 0→X on every pass.
-                if let Ok(mut q) = shared_quantities.lock() { *q = known.clone(); }
+                let crafting: Vec<CraftingJob> = blob.pending_recipes.iter().map(|r| {
+                    let name = display_names.iter().zip(unique_names.iter())
+                        .find(|(_, u)| **u == r.item_type)
+                        .map(|(d, _)| d.clone())
+                        .unwrap_or_else(|| r.item_type.split('/').last().unwrap_or("?").to_string());
+                    CraftingJob { unique_name: r.item_type.clone(), item_name: name, completion_ms: r.completion_ms }
+                }).collect();
+                *shared_crafting.lock().unwrap_or_else(|e| e.into_inner()) = crafting.clone();
+                let _ = app.emit("inventory-update", InventoryUpdate {
+                    quantities: emit_qty,
+                    crafting,
+                    mastery_rank: current_mastery_rank,
+                    mastery_data: current_mastery_data.clone(),
+                    changes,
+                    warframe_running: true,
+                    scanned_at:   now,
+                    consumed_suits:   current_consumed_suits.clone(),
+                    mods:             known_mods.clone(),
+                    socketed_shards:  current_socketed_shards.clone(),
+                    is_full_pass:     true,
+                });
 
-                // Full pass done — truncate log so the next pass starts fresh,
-                // then write a summary header + stability buffer state.
-                let now_str = chrono::DateTime::from_timestamp(now, 0)
-                    .map(|dt: chrono::DateTime<chrono::Utc>| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                    .unwrap_or_else(|| now.to_string());
-                match std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&log_path) {
-                    Ok(mut f) => {
-                        let _ = writeln!(f, "=== Full pass complete at {} (regions={} known_items={}) ===",
-                            now_str, pass_regions, known.len());
-                        // Stability buffer: show every unique item and its confirmation count.
-                        // count=1 means seen once (needs one more pass), count=2 means confirmed+emitted.
-                        let mut stable_entries: Vec<(&String, &u8)> = unique_stable.iter().collect();
-                        stable_entries.sort_by_key(|(k, _)| k.as_str());
-                        for (name, count) in &stable_entries {
-                            let tail = name.split('/').filter(|s| !s.is_empty())
-                                .collect::<Vec<_>>().iter().rev().take(2).rev()
-                                .cloned().collect::<Vec<_>>().join("/");
-                            let status = if **count >= 2 { "CONFIRMED" } else { "pending(1/2)" };
-                            let _ = writeln!(f, "  [stable] {}/{}  {}  {}", count, 2, tail, status);
-                        }
-                        if stable_entries.is_empty() {
-                            let _ = writeln!(f, "  [stable] (empty — no unique items seen this pass)");
-                        }
-                    }
-                    Err(e) => eprintln!("[monitor] log open failed: {}", e),
-                }
+                let detail = format!(
+                    "{} unique · {} resources · {} mods · {} flavour",
+                    blob.unique_items.len(), blob.stackable_items.len(),
+                    blob.mods.len(), blob.flavour_items.len()
+                );
+                eprintln!("[monitor] blob applied: {}", detail);
+                let _ = app.emit("blob-status", BlobStatusPayload {
+                    stage: "done".into(),
+                    detail,
+                });
 
-                // Daily snapshots.
+                // Daily snapshots
                 let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
                 if today != last_snapshot_date {
                     last_snapshot_date = today.clone();
@@ -4240,146 +3779,54 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                         }
                     }
                 }
+            }
 
-                // ── Actual-inventory 2-pass zeroing ──────────────────────────────────
-                // Only fires when the real account inventory was confirmed this pass
-                // (identified by "Created":{"$date": in any chunk, or hint MiscItems found).
-                // Items absent from 2 consecutive actual inventory passes are zeroed (resources)
-                // or removed (unique items). Passes where the inventory blob wasn't found
-                // (e.g. during a mission) are skipped entirely — no items are removed.
-                if pass_found_actual_inventory {
-                    actual_inv_count += 1;
-                    // Only the hint-region results (confirmed MiscItems from the actual account
-                    // inventory) update item_last_actual_scan. pass_resource_counts spans all
-                    // blobs in memory (mission deltas, NPC data, etc.) and must not reset the
-                    // absence counter — otherwise false-positive items from other blobs would
-                    // never be zeroed.
-                    for path in pass_hint_resources.keys() {
-                        item_last_actual_scan.insert(path.clone(), actual_inv_count);
-                    }
-                    // Unique items: pass_unique_seen already excludes mission-delta blobs
-                    // via the is_mission_delta guard in the scanner.
-                    for name in pass_unique_seen.keys() {
-                        let canonical = path_aliases.get(name.as_str())
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| name.clone());
-                        unique_last_actual_scan.insert(canonical, actual_inv_count);
-                    }
-
-                    // Zero resources absent from 2+ consecutive actual inventory passes.
-                    // Currency paths (/_currency/) are never in MiscItems so never in hint
-                    // resources — exclude them from zeroing to avoid wiping endo/credits.
-                    // Flavour paths are excluded too (managed by their own logic).
-                    // Only zero items the hint has previously confirmed (last_scan > 0).
-                    // Items pre-populated from the startup cache but never seen by the hint
-                    // scanner have last_scan == 0 — they must not be zeroed, because the hint
-                    // region may simply not cover every inventory array.
-                    let to_zero: Vec<String> = known.iter()
-                        .filter(|(k, &v)| v > 0
-                            && !pass_hint_resources.contains_key(k.as_str())
-                            && !known_flavour_paths.contains(k.as_str())
-                            && !k.starts_with("/_currency/")
-                            && {
-                                let last = *item_last_actual_scan.get(k.as_str()).unwrap_or(&0);
-                                last > 0 && actual_inv_count.saturating_sub(last) >= 2
-                            })
-                        .map(|(k, _)| k.clone())
-                        .collect();
-                    for path in to_zero {
-                        let old_qty = *known.get(&path).unwrap_or(&0);
-                        let display = path_to_name.get(&path)
-                            .cloned()
-                            .unwrap_or_else(|| path.split('/').last().unwrap_or("?").to_string());
-                        let change = QuantityChange {
-                            id: 0, unique_name: path.clone(), item_name: display.clone(),
-                            old_qty, new_qty: 0, delta: -old_qty, timestamp: now,
-                        };
-                        let _ = db::add_quantity_change(&conn, &path, &display, old_qty, 0);
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&changes_log_path) {
-                            let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                            let _ = writeln!(f, "[{}] Memory Scanner | {} | {} → 0 (absent 2 actual-inv passes)", ts, display, old_qty);
-                        }
-                        unique_changes.push(change);
-                        known.insert(path.clone(), 0);
-                        pending_resources.remove(&path);
-                    }
-
-                    // Remove confirmed unique items absent from 2+ consecutive actual inventory passes.
-                    // Require last > 0: items pre-seeded from the startup cache (never confirmed
-                    // by the live scanner) must not be removed just because the rolling scan
-                    // happened to cover only a partial/stale Suits region this pass.
-                    let to_remove_unique: Vec<String> = confirmed_unique.iter()
-                        .filter(|path| {
-                            let last = *unique_last_actual_scan.get(path.as_str()).unwrap_or(&0);
-                            last > 0 && actual_inv_count.saturating_sub(last) >= 2
-                        })
-                        .cloned()
-                        .collect();
-                    for path in to_remove_unique {
-                        let display = path_to_name.get(&path)
-                            .cloned()
-                            .unwrap_or_else(|| path.split('/').last().unwrap_or("?").to_string());
-                        let change = QuantityChange {
-                            id: 0, unique_name: path.clone(), item_name: display.clone(),
-                            old_qty: 1, new_qty: 0, delta: -1, timestamp: now,
-                        };
-                        let _ = db::add_quantity_change(&conn, &path, &display, 1, 0);
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&changes_log_path) {
-                            let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                            let _ = writeln!(f, "[{}] Memory Scanner | {} | 1 → 0 (unique absent 2 actual-inv passes)", ts, display);
-                        }
-                        unique_changes.push(change);
-                        confirmed_unique.remove(&path);
-                        unique_stable.remove(&path);
-                    }
-                }
-
-                // Emit the final shard + mastery state once per full pass.
-                // This is the authoritative update — intermediate emits may have missed
-                // the warframe-data region if no resource changes happened in that window.
-                {
-                    let mut emit_qty = known.clone();
-                    for k in &confirmed_unique {
-                        emit_qty.entry(k.clone()).or_insert(1);
-                    }
-                    for (path, mc) in &known_mods {
-                        emit_qty.entry(path.clone()).or_insert(mc.total);
-                    }
-                    let crafting: Vec<CraftingJob> = pass_recipes.iter().map(|r| {
-                        let name = display_names.iter().zip(unique_names.iter())
-                            .find(|(_, u)| *u == &r.unique_name)
-                            .map(|(d, _)| d.clone())
-                            .unwrap_or_else(|| r.unique_name.split('/').last().unwrap_or("?").to_string());
-                        CraftingJob { unique_name: r.unique_name.clone(), item_name: name, completion_ms: r.completion_ms }
-                    }).collect();
-                    let mut all_changes = resource_changes;
-                    all_changes.extend(unique_changes);
-                    let _ = app.emit("inventory-update", InventoryUpdate {
-                        quantities: emit_qty, crafting,
-                        mastery_rank: pass_mastery_rank,
-                        mastery_data: pass_mastery_data.clone(),
-                        changes: all_changes, warframe_running: true, scanned_at: now,
-                        consumed_suits: pass_consumed_suits.clone(),
-                        mods: known_mods.clone(),
-                        socketed_shards: pass_socketed_shards.clone(),
-                        is_full_pass: true,
+            // Periodic blob capture every 30s while game is running
+            let game_running = memory_scanner::find_warframe_pid_pub().is_some();
+            if game_running {
+                let should_capture = last_blob_time
+                    .map_or(true, |t: std::time::Instant| t.elapsed() >= std::time::Duration::from_secs(30));
+                if should_capture {
+                    last_blob_time = Some(std::time::Instant::now());
+                    let ts   = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
+                    let dir  = blob_log_dir.clone();
+                    let tx   = blob_tx.clone();
+                    let save = blob_log_enabled.load(Ordering::SeqCst);
+                    let _ = app.emit("blob-status", BlobStatusPayload {
+                        stage:  "scanning".into(),
+                        detail: "Reading Warframe memory\u{2026}".into(),
+                    });
+                    eprintln!("[monitor] blob capture starting (save={})", save);
+                    std::thread::spawn(move || {
+                        let count = memory_scanner::capture_all_blobs(&dir, &ts, tx, save);
+                        eprintln!("[monitor] blob capture finished (files_saved={} save_flag={} ts={})", count, save, ts);
                     });
                 }
-
-                // Reset pass accumulators.
-                pass_log_lines.clear();
-                pass_regions = 0;
-                pass_unique_seen.clear();
-                pass_resource_counts.clear();
-                pass_hint_resources.clear();
-                pass_found_actual_inventory = false;
-                pass_hint_flavour.clear();
-                flavour_scanned_this_pass = false;
-                pass_recipes.clear();
-                blob_saved_this_pass = false;
-                // pass_consumed_suits intentionally NOT cleared — subsumption is permanent.
-                // Keep mastery data — it doesn't change often.
+            } else {
+                // Game not running — emit current cached state
+                let mut emit_qty = known.clone();
+                for k in &confirmed_unique { emit_qty.entry(k.clone()).or_insert(1); }
+                for (p, mc) in &known_mods { emit_qty.entry(p.clone()).or_insert(mc.total); }
+                let crafting: Vec<CraftingJob> = current_recipes.iter().map(|r| {
+                    let name = display_names.iter().zip(unique_names.iter())
+                        .find(|(_, u)| *u == &r.unique_name)
+                        .map(|(d, _)| d.clone())
+                        .unwrap_or_else(|| r.unique_name.split('/').last().unwrap_or("?").to_string());
+                    CraftingJob { unique_name: r.unique_name.clone(), item_name: name, completion_ms: r.completion_ms }
+                }).collect();
+                let _ = app.emit("inventory-update", InventoryUpdate {
+                    quantities: emit_qty, crafting,
+                    mastery_rank: current_mastery_rank,
+                    mastery_data: current_mastery_data.clone(),
+                    changes: vec![], warframe_running: false, scanned_at: now,
+                    consumed_suits: current_consumed_suits.clone(),
+                    mods: known_mods.clone(),
+                    socketed_shards: current_socketed_shards.clone(),
+                    is_full_pass: false,
+                });
             }
+
+            std::thread::sleep(std::time::Duration::from_secs(2));
         }
     });
 
@@ -5105,11 +4552,17 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                             // Reading AFTER capture (~100-400 ms) rather than before gives the
                             // EE.log VoidProjections sequence time to complete and write the
                             // correct squad count before we decide how many columns to use.
-                            let squad_arc2  = std::sync::Arc::clone(&squad_arc);
-                            let names_arc2  = std::sync::Arc::clone(&names_arc);
+                            let squad_arc2    = std::sync::Arc::clone(&squad_arc);
+                            let names_arc2    = std::sync::Arc::clone(&names_arc);
+                            let ocr_frame_arc = Arc::clone(&app.state::<AppState>().last_ocr_frame);
                             let result = tauri::async_runtime::spawn_blocking(move || {
                                 let (pixels, w, cap_h, full_h, cap_info) =
                                     ocr::capture_warframe_reward_area()?;
+                                // Cache the raw frame so auto-capture can write it to disk
+                                // without a second GPU readback (no extra GetDIBits stall).
+                                if let Ok(mut g) = ocr_frame_arc.lock() {
+                                    *g = Some((pixels.clone(), w, cap_h));
+                                }
                                 // Read hint AFTER capture — the sequence may have completed
                                 // during the PrintWindow/DXGI call.
                                 let hint_squad = squad_arc2.lock().ok().and_then(|g| *g);
@@ -5139,7 +4592,14 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                                     // card count. Waiting 3 extra attempts gives it time to arrive.
                                     let soft_retries_done = soft_complete_at
                                         .map_or(false, |sa| (attempt as usize).saturating_sub(sa) >= 3);
-                                    let confirm_ready = hint_squad.is_some() || soft_retries_done;
+                                    // If the EE hint just arrived saying the squad is LARGER than
+                                    // what we matched, suppress confirmation and keep retrying.
+                                    // The next pass will use word_card_count = hint_squad, split
+                                    // the columns correctly, and find the missing card.
+                                    let hint_wants_more = hint_squad
+                                        .map_or(false, |h| h > items.len());
+                                    let confirm_ready = !hint_wants_more
+                                        && (hint_squad.is_some() || soft_retries_done);
 
                                     // Save best result; only emit to overlay when confirmed (LOCK).
                                     // Partial updates are intentionally suppressed — emitting
@@ -5564,6 +5024,7 @@ fn ws_mission_type(mt: &str) -> String {
         "MT_ORPHIX"           => "Orphix",
         "MT_VOID_CASCADE"     => "Void Cascade",
         "MT_VOID_FLOOD"       => "Void Flood",
+        "MT_CORRUPTION"       => "Void Flood",
         "MT_VOID_ARMAGEDDON"  => "Void Armageddon",
         "MT_MIRROR_DEFENSE"   => "Mirror Defense",
         "MT_CAMP"             => "Volatile",
@@ -6268,88 +5729,149 @@ fn get_overlay_session_log() -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|_| "(no session log yet — trigger a Void Fissure first)".into())
 }
 
+fn diag_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("warframe-companion").join("diagnostics")
+}
+
+fn dir_size_bytes(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0; };
+    entries.filter_map(|e| e.ok()).map(|e| {
+        let p = e.path();
+        if p.is_dir() { dir_size_bytes(&p) }
+        else { std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0) }
+    }).sum()
+}
+
+
+/// Return the total size of %TEMP%\warframe-companion\diagnostics\ in bytes.
+#[tauri::command]
+fn get_diag_folder_size() -> u64 {
+    dir_size_bytes(&diag_dir())
+}
+
+/// Delete all timestamped capture folders inside the diagnostics directory.
+/// Returns the size after deletion (always 0 on success).
+#[tauri::command]
+fn clear_diag_folder() -> u64 {
+    let dir = diag_dir();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let p = entry.path();
+            if p.is_dir() { let _ = std::fs::remove_dir_all(&p); }
+            else          { let _ = std::fs::remove_file(&p); }
+        }
+    }
+    0
+}
+
+/// Write BGRA pixels as an uncompressed 24-bit BGR BMP file.
+/// BMP is lossless and writes in microseconds regardless of resolution —
+/// PNG compression at 2560×1440 blocks for 1–3 s and froze the overlay.
+/// 24-bit BGR (BI_RGB) uses a standard 54-byte header with no colour masks,
+/// opening correctly in every image viewer.
+fn write_bmp(path: &std::path::Path, bgra: &[u8], w: u32, h: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    // 24-bit BGR rows must be padded to a 4-byte boundary.
+    let row_bytes  = (w as usize) * 3;
+    let padding    = (4 - (row_bytes % 4)) % 4;
+    let padded_row = row_bytes + padding;
+    let pixel_data_size = padded_row * h as usize;
+    let file_size = 54usize + pixel_data_size;
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    // BMP file header (14 bytes)
+    f.write_all(b"BM")?;
+    f.write_all(&(file_size as u32).to_le_bytes())?;
+    f.write_all(&[0u8; 4])?;            // reserved
+    f.write_all(&54u32.to_le_bytes())?; // pixel data starts immediately after 54-byte header
+    // BITMAPINFOHEADER (40 bytes)
+    f.write_all(&40u32.to_le_bytes())?;
+    f.write_all(&w.to_le_bytes())?;
+    f.write_all(&(h as i32).wrapping_neg().to_le_bytes())?; // negative height = top-down
+    f.write_all(&1u16.to_le_bytes())?;  // colour planes
+    f.write_all(&24u16.to_le_bytes())?; // bits per pixel
+    f.write_all(&0u32.to_le_bytes())?;  // BI_RGB — no compression, no extra masks
+    f.write_all(&(pixel_data_size as u32).to_le_bytes())?;
+    f.write_all(&[0u8; 16])?;           // XPelsPerMeter, YPelsPerMeter, ClrUsed, ClrImportant
+    // Pixel data: drop alpha channel (BGRA → BGR), pad each row to 4-byte boundary.
+    let pad = [0u8; 4];
+    for row in bgra.chunks_exact(w as usize * 4) {
+        for px in row.chunks_exact(4) {
+            f.write_all(&px[..3])?; // B, G, R
+        }
+        if padding > 0 { f.write_all(&pad[..padding])?; }
+    }
+    Ok(())
+}
+
 /// Capture a diagnostic bundle: scan log + screenshot of the full Warframe window
 /// (including any overlay on top via GDI desktop BitBlt / DXGI fallback).
 /// Saves everything to %TEMP%\warframe-companion\diagnostics\<timestamp>\ and
 /// returns the folder path so the frontend can show it.
 #[tauri::command]
-fn save_auto_diag_capture() -> Result<String, String> {
-    let ts = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
-    let folder = std::env::temp_dir()
-        .join("warframe-companion")
-        .join("diagnostics")
-        .join(&ts);
-    std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+async fn save_auto_diag_capture(state: State<'_, AppState>) -> Result<String, String> {
+    // Reuse the frame already captured by the OCR pipeline — no second GPU readback,
+    // so no GetDIBits stall that used to freeze the whole PC during fissure VFX.
+    let frame = state.last_ocr_frame.lock()
+        .ok()
+        .and_then(|g| g.clone());
 
-    let session_log = std::env::temp_dir().join("frameforge_overlay_session.txt");
-    if session_log.exists() {
-        let _ = std::fs::copy(&session_log, folder.join("ocr_session_log.txt"));
-    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let ts = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
+        let folder = std::env::temp_dir()
+            .join("warframe-companion")
+            .join("diagnostics")
+            .join(&ts);
+        std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
 
-    match ocr::capture_screen_for_diagnostics() {
-        Ok((pixels_bgra, w, h)) => {
-            let mut rgba = Vec::with_capacity(pixels_bgra.len());
-            for p in pixels_bgra.chunks_exact(4) {
-                rgba.extend_from_slice(&[p[2], p[1], p[0], p[3]]);
+        let session_log = std::env::temp_dir().join("frameforge_overlay_session.txt");
+        if session_log.exists() {
+            let _ = std::fs::copy(&session_log, folder.join("ocr_session_log.txt"));
+        }
+
+        match frame {
+            Some((pixels, w, h)) => {
+                let _ = write_bmp(&folder.join("screenshot.bmp"), &pixels, w, h);
             }
-            let png_path = folder.join("screenshot.png");
-            let file = std::fs::File::create(&png_path).map_err(|e| e.to_string())?;
-            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
-            enc.set_color(png::ColorType::Rgba);
-            enc.set_depth(png::BitDepth::Eight);
-            enc.write_header()
-                .and_then(|mut wr| wr.write_image_data(&rgba))
-                .map_err(|e| e.to_string())?;
+            None => {
+                let _ = std::fs::write(
+                    folder.join("screenshot_note.txt"),
+                    "No OCR frame captured yet — trigger a Void Fissure first.",
+                );
+            }
         }
-        Err(e) => {
-            let _ = std::fs::write(folder.join("screenshot_error.txt"), &e);
-        }
-    }
 
-    Ok(folder.to_string_lossy().into_owned())
+        Ok(folder.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn capture_diagnostics(state: State<'_, AppState>) -> Result<String, String> {
-    let ts = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
-    let folder = std::env::temp_dir()
-        .join("warframe-companion")
-        .join("diagnostics")
-        .join(&ts);
-    std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+async fn capture_diagnostics(state: State<'_, AppState>) -> Result<String, String> {
+    let log_path     = state.log_path.clone();
+    let changes_path = state.changes_log_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let ts = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
+        let folder = std::env::temp_dir()
+            .join("warframe-companion")
+            .join("diagnostics")
+            .join(&ts);
+        std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
 
-    // Copy the scanner log
-    if state.log_path.exists() {
-        let _ = std::fs::copy(&state.log_path, folder.join("scan_log.txt"));
-    }
-    // Copy the change log
-    if state.changes_log_path.exists() {
-        let _ = std::fs::copy(&state.changes_log_path, folder.join("changes_log.txt"));
-    }
+        if log_path.exists()     { let _ = std::fs::copy(&log_path,     folder.join("scan_log.txt")); }
+        if changes_path.exists() { let _ = std::fs::copy(&changes_path, folder.join("changes_log.txt")); }
 
-    // Screenshot
-    match ocr::capture_screen_for_diagnostics() {
-        Ok((pixels_bgra, w, h)) => {
-            // BGRA → RGBA for PNG encoding
-            let mut rgba = Vec::with_capacity(pixels_bgra.len());
-            for p in pixels_bgra.chunks_exact(4) {
-                rgba.extend_from_slice(&[p[2], p[1], p[0], p[3]]);
-            }
-            let png_path = folder.join("screenshot.png");
-            let file = std::fs::File::create(&png_path).map_err(|e| e.to_string())?;
-            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
-            enc.set_color(png::ColorType::Rgba);
-            enc.set_depth(png::BitDepth::Eight);
-            enc.write_header()
-                .and_then(|mut wr| wr.write_image_data(&rgba))
-                .map_err(|e| e.to_string())?;
+        // Half-resolution capture: StretchBlt destination is 4× smaller, so GetDIBits
+        // reads 4× less data — significantly reduces GPU stall time.
+        match ocr::capture_screen_for_diagnostics_half() {
+            Ok((pixels_bgra, w, h)) => { let _ = write_bmp(&folder.join("screenshot.bmp"), &pixels_bgra, w, h); }
+            Err(e) => { let _ = std::fs::write(folder.join("screenshot_error.txt"), &e); }
         }
-        Err(e) => {
-            let _ = std::fs::write(folder.join("screenshot_error.txt"), &e);
-        }
-    }
 
-    Ok(folder.to_string_lossy().into_owned())
+        Ok(folder.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Returns the Warframe game CLIENT AREA as [x, y, width, height] in screen pixels.
@@ -6514,8 +6036,7 @@ struct CachedItem {
     #[serde(default, skip_serializing_if = "is_false")]
     tradeable_wfm: bool,
     /// True when this item was detected via the FlavourItems array (glyphs, skins,
-    /// colour palettes, animation sets, etc.). Used to pre-seed known_flavour_paths
-    /// on restart so the vanish check doesn't zero them before the first hint scan.
+    /// colour palettes, animation sets, etc.).
     #[serde(default, skip_serializing_if = "is_false")]
     is_flavour: bool,
 }
@@ -6562,123 +6083,102 @@ fn is_unique_path(p: &str) -> bool {
         || p.starts_with("/Lotus/Types/Enemies/")
 }
 
-/// Build a fresh `InventoryStateCache` from scanner data plus preserved API fields.
-fn build_inventory_cache(
-    known: &HashMap<String, i64>,
-    unique_stable: &HashMap<String, u8>,
-    known_mods: &HashMap<String, memory_scanner::ModCount>,
-    mastery_rank: Option<u32>,
-    mastery_data: &HashMap<String, u32>,
-    consumed_suits: &[String],
-    socketed_shards: &HashMap<String, Vec<memory_scanner::ArchonShard>>,
+
+/// Build a fresh `InventoryStateCache` from a parsed FULL_ACCOUNT blob.
+/// All sections are authoritative — this fully replaces scanner-derived data.
+fn build_inventory_from_blob(
+    blob: &memory_scanner::BlobInventory,
     path_to_name: &HashMap<String, String>,
+    path_to_category: &HashMap<String, String>,
     path_to_ducat: &HashMap<String, u32>,
     path_to_vaulted: &HashMap<String, bool>,
-    path_to_category: &HashMap<String, String>,
-    existing_wfm_prices: &HashMap<String, u32>,
     relic_drops: &HashMap<String, Vec<String>>,
-    api_quantities: HashMap<String, i64>,
-    api_mod_copies: Vec<ApiModCopy>,
+    existing_wfm_prices: &HashMap<String, u32>,
     excluded_paths: &std::collections::HashSet<String>,
-    known_flavour_paths: &std::collections::HashSet<String>,
 ) -> InventoryStateCache {
     let mut items: HashMap<String, CachedItem> = HashMap::new();
 
-    macro_rules! get_or_insert {
-        ($path:expr) => {
-            items.entry($path.clone()).or_insert_with(|| CachedItem {
-                unique_name: $path.clone(),
-                name: path_to_name.get($path).cloned().unwrap_or_default(),
+    macro_rules! upsert {
+        ($path:expr) => {{
+            let p: &str = $path;
+            items.entry(p.to_string()).or_insert_with(|| CachedItem {
+                unique_name: p.to_string(),
+                name: path_to_name.get(p).cloned().unwrap_or_default(),
                 ..Default::default()
             })
-        };
+        }};
     }
 
-    for (path, &qty) in known {
+    // Currency (virtual paths not in WFCD catalog).
+    upsert!("/_currency/Credits").amount     = blob.credits;
+    upsert!("/_currency/Endo").amount        = blob.endo;
+    upsert!("/_currency/Platinum").amount    = blob.platinum - blob.free_platinum;
+    upsert!("/_currency/PlatinumGift").amount = blob.free_platinum;
+
+    // Unique items — binary owned (amount = 1).
+    for entry in &blob.unique_items {
+        if excluded_paths.contains(&entry.item_type) { continue; }
+        let item = upsert!(&entry.item_type);
+        item.amount        = 1;
+        item.archon_shards = entry.archon_shards.clone();
+        if entry.polarized > 0 { item.forma_count = Some(entry.polarized); }
+    }
+
+    // Subsumed warframes (InfestedFoundry.ConsumedSuits).
+    for path in &blob.consumed_suits {
         if excluded_paths.contains(path) { continue; }
-        get_or_insert!(path).amount = qty;
+        upsert!(path).subsumed = true;
     }
-    for (path, &count) in unique_stable {
+
+    // Stackable items — resources, relics, blueprints, ayatan, decorations.
+    for entry in &blob.stackable_items {
+        if excluded_paths.contains(&entry.item_type) { continue; }
+        if entry.item_count <= 0 { continue; }
+        upsert!(&entry.item_type).amount = entry.item_count;
+    }
+
+    // Mods and arcanes (merged from RawUpgrades + Upgrades).
+    for (path, mc) in &blob.mods {
         if excluded_paths.contains(path) { continue; }
-        if count >= 1 { get_or_insert!(path).amount = 1; }
-    }
-    for (path, &rank) in mastery_data {
-        if rank > 0 { get_or_insert!(path).mastery_rank = rank; }
-    }
-    for (path, shards) in socketed_shards {
-        get_or_insert!(path).archon_shards = shards.clone();
-    }
-    for (path, mc) in known_mods {
-        let entry = get_or_insert!(path);
-        entry.amount = mc.total;
-        entry.mod_ranks = Some(mc.by_rank.iter().map(|(&r, &c)| (r.to_string(), c)).collect());
-    }
-    for path in consumed_suits {
-        get_or_insert!(path).subsumed = true;
-    }
-    // API quantities: fill in items the scanner hasn't found this session.
-    // Scanner data written above is authoritative — API only covers the gaps.
-    for (path, &qty) in &api_quantities {
-        if !known.contains_key(path) && !unique_stable.contains_key(path) && !known_mods.contains_key(path) {
-            get_or_insert!(path).amount = qty;
-        }
-    }
-    // API mod copies: same — only fill mods the scanner hasn't seen.
-    for mc in &api_mod_copies {
-        if !known_mods.contains_key(&mc.unique_name) {
-            let entry = get_or_insert!(&mc.unique_name);
-            let ranks = entry.mod_ranks.get_or_insert_with(HashMap::new);
-            let rank_key = mc.rank.map(|r| r.to_string()).unwrap_or_else(|| "0".to_string());
-            *ranks.entry(rank_key).or_insert(0) = mc.count;
-            entry.amount = ranks.values().sum();
-        }
+        let item = upsert!(path);
+        item.amount    = mc.total;
+        item.mod_ranks = Some(mc.by_rank.iter().map(|(&r, &c)| (r.to_string(), c)).collect());
     }
 
-    // Mark FlavourItems paths so they can be re-seeded into known_flavour_paths on restart.
-    // Three cases for known[path]:
-    //   Some(n>0)  → owned and committed — mark is_flavour (amount already set above).
-    //   None       → not yet in known (FlavourItems commit is end-of-pass; this may be a
-    //                mid-pass cache save). Write amount=1 so the path survives a restart.
-    //   Some(0)    → explicitly sold/removed — skip; don't seed is_flavour so it won't be
-    //                re-added on next startup.
-    for path in known_flavour_paths {
-        match known.get(path).copied() {
-            Some(0) => {} // sold — do not seed
-            _ => {
-                let entry = get_or_insert!(path);
-                entry.is_flavour = true;
-                entry.amount = 1; // binary-owned; always 1
-                entry.mod_ranks = None; // strip mod-scanner data (skins appear in RawUpgrades)
-            }
-        }
+    // FlavourItems (glyphs, palettes, emotes, titles, ship skins) and
+    // WeaponSkins (sigils, cosmetic overlays): occurrence count = amount owned.
+    for (path, &count) in blob.flavour_items.iter().chain(blob.weapon_skins.iter()) {
+        if excluded_paths.contains(path) { continue; }
+        let item = upsert!(path);
+        item.amount    = count;
+        item.is_flavour = true;
     }
 
-    // Populate catalog-derived fields and carry forward any previously-fetched WFM price.
-    for (path, entry) in items.iter_mut() {
-        entry.ducat_price   = path_to_ducat.get(path).copied();
-        entry.vaulted       = path_to_vaulted.get(path).copied();
-        entry.category      = path_to_category.get(path).cloned().unwrap_or_default();
-        entry.relic_reward  = relic_drops.contains_key(path.as_str());
-        // tradeable_wfm: prime parts/blueprints (have ducat value) and mods/arcanes are
-        // individually listed on WFM. The flag is also updated (to false) by the WFM queue
-        // drain when a fetch confirms the item is not listed.
-        let tradeable = entry.ducat_price.is_some()
-            || matches!(entry.category.as_str(), "Mods" | "Arcanes");
-        entry.tradeable_wfm = tradeable;
+    // Mastery rank per item from XPInfo.
+    for (path, &rank) in &blob.mastery_data {
+        if rank > 0 { upsert!(path).mastery_rank = rank; }
+    }
+
+    // Catalog-derived fields + carry forward fetched WFM prices.
+    for (path, item) in items.iter_mut() {
+        item.ducat_price  = path_to_ducat.get(path).copied();
+        item.vaulted      = path_to_vaulted.get(path).copied();
+        item.category     = path_to_category.get(path).cloned().unwrap_or_default();
+        item.relic_reward = relic_drops.contains_key(path.as_str());
+        let tradeable = item.ducat_price.is_some()
+            || matches!(item.category.as_str(), "Mods" | "Arcanes");
+        item.tradeable_wfm = tradeable;
         if tradeable {
-            if let Some(&p) = existing_wfm_prices.get(path) {
-                entry.wfm_price = Some(p);
-            }
+            if let Some(&p) = existing_wfm_prices.get(path) { item.wfm_price = Some(p); }
         }
     }
 
-    // Final purge: remove any alias (secondary) paths that slipped in via api_quantities,
-    // mastery_data, or other sources. They're phantom duplicates of the canonical entry.
-    for path in excluded_paths {
-        items.remove(path);
-    }
+    for path in excluded_paths { items.remove(path); }
 
-    InventoryStateCache { items, mastery_rank }
+    InventoryStateCache {
+        items,
+        mastery_rank: if blob.mastery_level > 0 { Some(blob.mastery_level) } else { None },
+    }
 }
 
 fn load_inventory_state_cache(path: &PathBuf) -> InventoryStateCache {
@@ -6874,6 +6374,7 @@ pub fn run() {
             current_mods: Arc::new(Mutex::new(initial_mods)),
             api_quantities_cache: Arc::new(Mutex::new(HashMap::new())),
             api_mod_copies_cache: Arc::new(Mutex::new(Vec::new())),
+            last_ocr_frame: Arc::new(Mutex::new(None)),
             current_crafting: Arc::new(Mutex::new(vec![])),
             monitor_active: Arc::new(AtomicBool::new(false)),
             raw_scan_active: Arc::new(AtomicBool::new(false)),
@@ -6989,6 +6490,8 @@ pub fn run() {
             fetch_worldstate,
             get_warframe_window_rect,
             get_overlay_session_log,
+            get_diag_folder_size,
+            clear_diag_folder,
             save_auto_diag_capture,
             capture_diagnostics,
             start_monitor,

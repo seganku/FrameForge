@@ -1,6 +1,6 @@
 [package]
 name = "warframe-companion"
-version = "2.0.0"
+version = "2.1.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -28,7 +28,6 @@ tungstenite = { version = "0.26", features = ["native-tls"] }
 native-tls = "0.2"
 whirlpool = "0.10"
 lzma-rs = "0.3"
-png = "0.17"
 
 [profile.dev]
 opt-level = 1

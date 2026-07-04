@@ -278,12 +278,11 @@ pub fn add_quantity_change(
     old_qty: i64,
     new_qty: i64,
 ) -> Result<()> {
-    let delta = new_qty - old_qty;
-    let timestamp = chrono::Utc::now().timestamp();
+    let ts = chrono::Utc::now().timestamp();
     conn.execute(
         "INSERT INTO quantity_changes (unique_name, item_name, old_qty, new_qty, delta, timestamp)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![unique_name, item_name, old_qty, new_qty, delta, timestamp],
+        params![unique_name, item_name, old_qty, new_qty, new_qty - old_qty, ts],
     )?;
     Ok(())
 }

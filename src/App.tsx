@@ -211,6 +211,11 @@ function ItemImg({ imageName, category, size = 32 }: { imageName?: string; categ
 
 
 function fmt(n: number) { return n.toLocaleString(); }
+function fmtBytes(n: number) {
+  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  if (n >= 1024)        return `${Math.round(n / 1024)} KB`;
+  return `${n} B`;
+}
 function deltaClass(d: number) { return d > 0 ? "delta-pos" : "delta-neg"; }
 function deltaText(d: number) { return d > 0 ? `+${fmt(d)}` : fmt(d); }
 function timeStr(ts: number) {
@@ -399,9 +404,10 @@ export default function App() {
   const [diagCapturing, setDiagCapturing] = useState(false);
   const [diagPath, setDiagPath] = useState<string | null>(null);
   const [autoDiagEnabled, setAutoDiagEnabled] = useState(false);
+  const [diagFolderSize, setDiagFolderSize] = useState<number>(0);
   const [companionApiEnabled, setCompanionApiEnabled] = useState(false);
   const [memoryScannerEnabled, setMemoryScannerEnabled] = useState(false);
-  const [blobLogEnabled, setBlobLogEnabled] = useState(false);
+const [blobLogEnabled, setBlobLogEnabled] = useState(false);
   const [wfmLoggedIn, setWfmLoggedIn] = useState(false);
   const [overlayStatus, setOverlayStatus] = useState("");
   const [subsummedWarframes, setSubsummedWarframes] = useState<Set<string>>(new Set());
@@ -456,6 +462,9 @@ export default function App() {
   const [clearMsg, setClearMsg] = useState("");
   const [appVersion, setAppVersion] = useState("");
   const [updateAvailable, setUpdateAvailable] = useState<string | null>(null);
+  // "scanning" while blob capture is running, "done" briefly after it finishes
+  const [blobStage, setBlobStage] = useState<"scanning" | "done" | null>(null);
+  const blobDoneTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [textScale, setTextScale] = useState(() => {
     const s = parseFloat(localStorage.getItem("ff-text-scale") ?? "1");
     document.documentElement.style.setProperty("--ff-scale", s.toString());
@@ -558,7 +567,7 @@ export default function App() {
         if (typeof s.companionApiEnabled === "boolean") setCompanionApiEnabled(s.companionApiEnabled);
         if (typeof s.memoryScannerEnabled === "boolean") setMemoryScannerEnabled(s.memoryScannerEnabled);
         if (typeof s.blobLogEnabled === "boolean") setBlobLogEnabled(s.blobLogEnabled);
-        if (typeof s.autoDiagEnabled === "boolean") {
+if (typeof s.autoDiagEnabled === "boolean") {
           setAutoDiagEnabled(s.autoDiagEnabled);
           localStorage.setItem("ff-auto-diag", String(s.autoDiagEnabled));
         }
@@ -601,6 +610,7 @@ export default function App() {
 
     invoke<CatalogItem[]>("get_all_items").then(items => { setCatalog(items); catalogRef.current = items; });
     invoke<Record<string, number>>("get_current_quantities").then(setQuantities);
+    invoke<number>("get_diag_folder_size").then(setDiagFolderSize).catch(() => {});
     invoke<QuantityChange[]>("get_change_log", { limit: 200 }).then(log => {
       setChangeLog(log);
       const lc: Record<string, number> = {};
@@ -642,6 +652,14 @@ export default function App() {
         setMonitoring(true);
       }
     });
+  }, []);
+
+  // Refresh diagnostics folder size every minute so the Clear button stays current.
+  useEffect(() => {
+    const id = setInterval(() => {
+      invoke<number>("get_diag_folder_size").then(setDiagFolderSize).catch(() => {});
+    }, 60_000);
+    return () => clearInterval(id);
   }, []);
 
   // ── Inventory update events ────────────────────────────────────────────────
@@ -716,6 +734,21 @@ export default function App() {
           for (const c of p.changes) next[c.unique_name] = c.timestamp;
           return next;
         });
+      }
+    });
+    return () => { unlisten.then(fn => fn()); };
+  }, []);
+
+  // ── Blob processing status ────────────────────────────────────────────────
+  useEffect(() => {
+    const unlisten = listen<{ stage: string; detail: string }>("blob-status", e => {
+      const { stage } = e.payload;
+      if (stage === "scanning") {
+        if (blobDoneTimerRef.current) clearTimeout(blobDoneTimerRef.current);
+        setBlobStage("scanning");
+      } else if (stage === "done") {
+        setBlobStage("done");
+        blobDoneTimerRef.current = setTimeout(() => setBlobStage(null), 4000);
       }
     });
     return () => { unlisten.then(fn => fn()); };
@@ -1508,6 +1541,16 @@ export default function App() {
         {masteryRank !== null && (
           <span className="mastery-badge" title="Mastery Rank">MR {masteryRank}</span>
         )}
+        {blobStage === "scanning" && (
+          <span className="blob-status-badge blob-status-scanning" title="Reading Warframe memory and processing inventory">
+            Processing Data…
+          </span>
+        )}
+        {blobStage === "done" && (
+          <span className="blob-status-badge blob-status-done" title="Inventory loaded from Warframe memory">
+            Inventory Loaded
+          </span>
+        )}
         <div className="header-right">
           {/* ── Connection status chips ── */}
           {(() => {
@@ -1757,12 +1800,6 @@ export default function App() {
                     {memoryScannerEnabled ? "Enabled" : "Disabled"}
                   </button>
                 </div>
-                <div className="settings-row" style={{ marginTop: 8, opacity: memoryScannerEnabled ? 1 : 0.4 }}>
-                  <div className="settings-row-info">
-                    <span className="settings-row-label">Scanner</span>
-                    <span className="settings-row-desc">{monitoring ? "Running — scans every 10 s" : "Stopped"}</span>
-                  </div>
-                </div>
                 <div className="settings-row" style={{ marginTop: 8, opacity: memoryScannerEnabled ? 1 : 0.4, pointerEvents: memoryScannerEnabled ? "auto" : "none" }}>
                   <div>
                     <span className="settings-row-label">Blob Logging</span>
@@ -1929,17 +1966,29 @@ export default function App() {
                       When the relic reward overlay appears, automatically saves a screenshot + OCR log to a timestamped folder in <code style={{ fontSize: 10 }}>%TEMP%\warframe-companion\diagnostics\</code>.
                     </span>
                   </div>
-                  <button
-                    className="btn-secondary"
-                    style={{ minWidth: 64, background: autoDiagEnabled ? "rgba(56,139,253,.15)" : undefined, borderColor: autoDiagEnabled ? "var(--accent)" : undefined }}
-                    onClick={() => {
-                      const next = !autoDiagEnabled;
-                      setAutoDiagEnabled(next);
-                      localStorage.setItem("ff-auto-diag", String(next));
-                      settingsRef.current = { ...settingsRef.current, autoDiagEnabled: next };
-                      saveAllSettings();
-                    }}
-                  >{autoDiagEnabled ? "On" : "Off"}</button>
+                  <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                    <button
+                      className="btn-secondary"
+                      style={{ minWidth: 64, background: autoDiagEnabled ? "rgba(56,139,253,.15)" : undefined, borderColor: autoDiagEnabled ? "var(--accent)" : undefined }}
+                      onClick={() => {
+                        const next = !autoDiagEnabled;
+                        setAutoDiagEnabled(next);
+                        localStorage.setItem("ff-auto-diag", String(next));
+                        settingsRef.current = { ...settingsRef.current, autoDiagEnabled: next };
+                        saveAllSettings();
+                      }}
+                    >{autoDiagEnabled ? "On" : "Off"}</button>
+                    {diagFolderSize > 0 && (
+                      <button
+                        className="btn-secondary"
+                        style={{ color: "var(--red)", borderColor: "var(--red)", whiteSpace: "nowrap" }}
+                        onClick={async () => {
+                          await invoke("clear_diag_folder");
+                          setDiagFolderSize(0);
+                        }}
+                      >Clear ({fmtBytes(diagFolderSize)})</button>
+                    )}
+                  </div>
                 </div>
                 <div className="settings-row" style={{ marginTop: 8 }}>
                   <div className="settings-row-info">
@@ -1962,6 +2011,7 @@ export default function App() {
                       try {
                         const path = await invoke<string>("capture_diagnostics");
                         setDiagPath(path);
+                        invoke<number>("get_diag_folder_size").then(setDiagFolderSize).catch(() => {});
                       } catch (e) {
                         setDiagPath(`Error: ${e}`);
                       } finally {
