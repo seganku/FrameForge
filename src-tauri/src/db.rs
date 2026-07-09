@@ -88,8 +88,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.pragma_update(None, "user_version", 2)?;
     }
 
-    // quantity_changes is a transient scan log — cleared on every startup intentionally.
-    conn.execute_batch("DELETE FROM quantity_changes;")?;
+    // Prune entries older than 7 days so the log doesn't grow unbounded.
+    conn.execute_batch(
+        "DELETE FROM quantity_changes WHERE timestamp < unixepoch('now', '-7 days');"
+    )?;
 
     Ok(())
 }

@@ -11,6 +11,8 @@ pub struct WfcdItem {
     pub vaulted: Option<bool>,
     pub ducats: Option<u32>,
     pub mastery_req: Option<u32>,
+    /// Riven disposition multiplier (omegaAttenuation). Present on weapons only.
+    pub omega_attenuation: Option<f32>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -66,6 +68,9 @@ pub struct FetchResult {
     pub wiki_reward_names: HashSet<String>,
     /// syndicate name → items available for purchase from that syndicate's store
     pub syndicate_catalog: HashMap<String, Vec<SyndicateOffer>>,
+    /// weapon unique_name → omegaAttenuation (riven disposition).
+    /// Extracted directly from All.json — no separate ExportWeapons.json fetch needed.
+    pub weapon_dispositions: HashMap<String, f32>,
 }
 
 /// Fetch the complete list of relic reward display names from the Warframe Wiki's
@@ -515,69 +520,64 @@ fn build_recipe_node(
     RecipeComponent { unique_name, name, count, result_count, components }
 }
 
-fn fetch_from_wfcd() -> Result<FetchResult, String> {
-    let categories: &[(&str, &str)] = &[
-        ("Misc",           "Resources"),
-        ("Resources",      "Resources"),
-        ("Mods",           "Mods"),
-        ("Relics",         "Relics"),
-        ("Warframes",      "Warframes"),
-        ("Primary",        "Primary"),
-        ("Secondary",      "Secondary"),
-        ("Melee",          "Melee"),
-        ("Arcanes",        "Arcanes"),
-        ("Sentinels",      "Companions"),
-        ("SentinelWeapons","Companions"),
-        ("Pets",           "Companions"),
-        ("Archwing",       "Archwing"),
-        ("Arch-Gun",       "Archwing"),
-        ("Arch-Melee",     "Archwing"),
-        ("Gear",           "Misc"),
-        ("Fish",           "Misc"),
-        ("Sigils",         "Sigils"),
-        ("Glyphs",         "Glyphs"),
-        // Skins.json also contains Emotes — both show under "Skins"
-        ("Skins",          "Skins"),
-    ];
+fn wfcd_category_to_display(wfcd_cat: &str) -> &'static str {
+    match wfcd_cat {
+        "Misc" | "Resources" => "Resources",
+        "Mods" => "Mods",
+        "Relics" => "Relics",
+        "Warframes" => "Warframes",
+        "Primary" => "Primary",
+        "Secondary" => "Secondary",
+        "Melee" => "Melee",
+        "Arcanes" => "Arcanes",
+        "Sentinels" | "SentinelWeapons" | "Pets" => "Companions",
+        "Archwing" | "Arch-Gun" | "Arch-Melee" => "Archwing",
+        "Gear" | "Fish" => "Misc",
+        "Sigils" => "Sigils",
+        "Glyphs" => "Glyphs",
+        "Skins" => "Skins",
+        _ => "Misc",
+    }
+}
 
+fn fetch_from_wfcd() -> Result<FetchResult, String> {
     let mut items: Vec<WfcdItem> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut errors: Vec<String> = Vec::new();
     let mut raw_craftable: Vec<(String, serde_json::Value)> = Vec::new();
-    // Relics stored separately: (relic_unique_name, rewards_array)
     let mut raw_relics: Vec<(String, serde_json::Value)> = Vec::new();
 
-    // ── Two-pass fetch ───────────────────────────────────────────────────────
-    // Pass 1: Fetch all files → collect top-level unique_names.
-    //   "Bronco" (Secondary.json top-level) must be known BEFORE it appears as
-    //   a component of "Akbolto" (Primary.json) so it keeps "Secondary" not "Parts".
-    // Pass 2: Process items and components using the cached data.
-    // ────────────────────────────────────────────────────────────────────────
-    let mut all_files: Vec<(String, Vec<serde_json::Value>)> = Vec::new(); // (category, items)
-    let mut top_level_uniques: HashSet<String> = HashSet::new();
+    // Single All.json request replaces 20 sequential per-category fetches.
+    let all_json: serde_json::Value = ureq::get(
+        "https://raw.githubusercontent.com/WFCD/warframe-items/master/data/json/All.json"
+    )
+    .set("User-Agent", "WarframeCompanion/0.1")
+    .call()
+    .map_err(|e| format!("All.json fetch: {}", e))?
+    .into_json()
+    .map_err(|e| format!("All.json parse: {}", e))?;
 
-    for (file, category) in categories {
-        let url = format!(
-            "https://raw.githubusercontent.com/WFCD/warframe-items/master/data/json/{}.json",
-            file
-        );
-        match ureq::get(&url).set("User-Agent", "WarframeCompanion/0.1").call() {
-            Ok(resp) => {
-                let json: serde_json::Value = match resp.into_json() {
-                    Ok(j) => j,
-                    Err(e) => { errors.push(format!("{}: {}", file, e)); continue; }
-                };
-                if let Some(arr) = json.as_array() {
-                    // Mini-pass: record all top-level unique_names in this file
-                    for item in arr.iter() {
-                        if let Some(u) = item.get("uniqueName").and_then(|v| v.as_str()) {
-                            top_level_uniques.insert(u.trim().to_string());
-                        }
-                    }
-                    all_files.push((category.to_string(), arr.clone()));
-                }
+    let all_items_raw = all_json.as_array()
+        .ok_or_else(|| "All.json: expected top-level array".to_string())?;
+
+    // Group items by display category to preserve the two-pass structure below.
+    let mut category_map: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    for item in all_items_raw.iter() {
+        let wfcd_cat = item.get("category").and_then(|v| v.as_str()).unwrap_or("");
+        let display_cat = wfcd_category_to_display(wfcd_cat).to_string();
+        category_map.entry(display_cat).or_default().push(item.clone());
+    }
+    let mut all_files: Vec<(String, Vec<serde_json::Value>)> = category_map.into_iter().collect();
+    all_files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Pass 1: record all top-level unique_names before processing components.
+    // "Bronco" (a standalone Secondary) must be known before it appears as a
+    // component of "Akbolto" so it keeps "Secondary" not "Parts".
+    let mut top_level_uniques: HashSet<String> = HashSet::new();
+    for (_, arr) in &all_files {
+        for item in arr.iter() {
+            if let Some(u) = item.get("uniqueName").and_then(|v| v.as_str()) {
+                top_level_uniques.insert(u.trim().to_string());
             }
-            Err(e) => errors.push(format!("{}: {}", file, e)),
         }
     }
 
@@ -598,20 +598,22 @@ fn fetch_from_wfcd() -> Result<FetchResult, String> {
                 None => continue,
             };
 
-            let image_name = item.get("imageName").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let vaulted     = item.get("vaulted").and_then(|v| v.as_bool());
-            let ducats      = item.get("ducats").and_then(|v| v.as_u64()).map(|n| n as u32);
-            let mastery_req = item.get("masteryReq").and_then(|v| v.as_u64()).map(|n| n as u32);
+            let image_name        = item.get("imageName").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let vaulted           = item.get("vaulted").and_then(|v| v.as_bool());
+            let ducats            = item.get("ducats").and_then(|v| v.as_u64()).map(|n| n as u32);
+            let mastery_req       = item.get("masteryReq").and_then(|v| v.as_u64()).map(|n| n as u32);
+            let omega_attenuation = item.get("omegaAttenuation").and_then(|v| v.as_f64()).map(|n| n as f32);
 
-            // The WFCD item's own category field is more specific than our file-based mapping.
-            // Use it for categories that have dedicated meaning (Sigils, Emotes, etc.)
-            // so they don't get swallowed into generic "Resources" or "Misc".
+            // `category` (display category from wfcd_category_to_display) groups similar WFCD
+            // categories together (e.g. "Sentinels"+"SentinelWeapons"+"Pets" → "Companions").
+            // `wfcd_item_cat` is the raw WFCD category on the item itself; used to preserve
+            // fine-grained categories like "Emotes", "Ephemera" that would otherwise fall into "Misc".
             let wfcd_item_cat = item.get("category").and_then(|v| v.as_str()).unwrap_or("");
 
             // Correct category before inserting:
             // • Blueprint items always go to "Blueprints"
-            // • Items whose WFCD category is something specific → use it
-            // • Non-relic items miscategorised under "Relics" → "Misc"
+            // • Fine-grained categories (Sigils, Emotes, Ephemera, Skins) → keep as-is
+            // • Non-relic items that WFCD groups under Relics (segments, etc.) → "Misc"
             let corrected_cat = if name.contains("Blueprint") {
                 "Blueprints".to_string()
             } else if matches!(wfcd_item_cat, "Sigils" | "Emotes" | "Skins" | "Ephemera") {
@@ -623,7 +625,7 @@ fn fetch_from_wfcd() -> Result<FetchResult, String> {
                 {
                     "Relics".to_string()
                 } else {
-                    "Misc".to_string() // blueprints/segments/etc. wrongly in WFCD Relics file
+                    "Misc".to_string() // segments/blueprints that WFCD mis-groups under Relics
                 }
             } else {
                 category.clone()
@@ -635,9 +637,8 @@ fn fetch_from_wfcd() -> Result<FetchResult, String> {
                     unique_name: unique_name.clone(),
                     category: corrected_cat.clone(),
                     image_name: image_name.clone(),
-                    vaulted, ducats, mastery_req,
+                    vaulted, ducats, mastery_req, omega_attenuation,
                 });
-
             }
 
             if let Some(comps) = item.get("components").and_then(|v| v.as_array()) {
@@ -744,6 +745,7 @@ fn fetch_from_wfcd() -> Result<FetchResult, String> {
                             vaulted: None,
                             ducats: comp_ducats,
                             mastery_req: None,
+                            omega_attenuation: None,
                         });
 
                         // Note: blueprint entries for these components are provided by
@@ -757,7 +759,7 @@ fn fetch_from_wfcd() -> Result<FetchResult, String> {
     }
 
     if items.is_empty() {
-        return Err(format!("All sources failed: {}", errors.join("; ")));
+        return Err("All.json returned no usable items".to_string());
     }
 
     let display_names: HashMap<String, String> = items
@@ -825,13 +827,14 @@ fn fetch_from_wfcd() -> Result<FetchResult, String> {
                 if let Some(rname) = result_name {
                     if seen.insert(bp_unique.clone()) {
                         bp_items.push(WfcdItem {
-                            name:        format!("{} Blueprint", rname),
-                            unique_name: bp_unique.clone(),
-                            category:    "Blueprints".to_string(),
-                            image_name:  image_by_unique.get(result_type).and_then(|i| i.clone()),
-                            vaulted:     None,
-                            ducats:      None,
-                            mastery_req: None,
+                            name:             format!("{} Blueprint", rname),
+                            unique_name:      bp_unique.clone(),
+                            category:         "Blueprints".to_string(),
+                            image_name:       image_by_unique.get(result_type).and_then(|i| i.clone()),
+                            vaulted:          None,
+                            ducats:           None,
+                            mastery_req:      None,
+                            omega_attenuation: None,
                         });
                     }
                 }
@@ -850,13 +853,14 @@ fn fetch_from_wfcd() -> Result<FetchResult, String> {
                 if let Some(bname) = built_name {
                     if seen.insert(result_type.clone()) {
                         bp_items.push(WfcdItem {
-                            name:        bname,
-                            unique_name: result_type.clone(),
-                            category:    "Parts".to_string(),
-                            image_name:  image_by_unique.get(result_type).and_then(|i| i.clone()),
-                            vaulted:     None,
-                            ducats:      None,
-                            mastery_req: None,
+                            name:             bname,
+                            unique_name:      result_type.clone(),
+                            category:         "Parts".to_string(),
+                            image_name:       image_by_unique.get(result_type).and_then(|i| i.clone()),
+                            vaulted:          None,
+                            ducats:           None,
+                            mastery_req:      None,
+                            omega_attenuation: None,
                         });
                     }
                 }
@@ -876,13 +880,14 @@ fn fetch_from_wfcd() -> Result<FetchResult, String> {
             if seen.contains(&bp_unique) { continue; }
             if seen.insert(bp_unique.clone()) {
                 bp_items.push(WfcdItem {
-                    name:        format!("{} Blueprint", item.name),
-                    unique_name: bp_unique,
-                    category:    "Blueprints".to_string(),
-                    image_name:  item.image_name.clone(),
-                    vaulted:     None,
-                    ducats:      None,
-                    mastery_req: None,
+                    name:             format!("{} Blueprint", item.name),
+                    unique_name:      bp_unique,
+                    category:         "Blueprints".to_string(),
+                    image_name:       item.image_name.clone(),
+                    vaulted:          None,
+                    ducats:           None,
+                    mastery_req:      None,
+                    omega_attenuation: None,
                 });
             }
         }
@@ -937,13 +942,14 @@ fn fetch_from_wfcd() -> Result<FetchResult, String> {
                     if !seen.contains(bp_unique) {
                         seen.insert(bp_unique.clone());
                         bp_additions.push(WfcdItem {
-                            name:        item.name.clone(),
-                            unique_name: bp_unique.clone(),
-                            category:    "Blueprints".to_string(),
-                            image_name:  item.image_name.clone(),
-                            vaulted:     item.vaulted,
-                            ducats:      item.ducats,
-                            mastery_req: item.mastery_req,
+                            name:             item.name.clone(),
+                            unique_name:      bp_unique.clone(),
+                            category:         "Blueprints".to_string(),
+                            image_name:       item.image_name.clone(),
+                            vaulted:          item.vaulted,
+                            ducats:           item.ducats,
+                            mastery_req:      item.mastery_req,
+                            omega_attenuation: None,
                         });
                     }
 
@@ -1110,7 +1116,30 @@ fn fetch_from_wfcd() -> Result<FetchResult, String> {
     // to the existing prime/forma filters in the overlay catalog builder.
     let wiki_reward_names = fetch_wiki_reward_names();
 
-    Ok(FetchResult { items, recipes, relic_drops, relic_rewards, blueprint_names, wiki_reward_names, syndicate_catalog })
+    // Propagate imageName from items that have one to same-named items that don't.
+    // StoreItems proxy entries (e.g. /Lotus/StoreItems/.../Kuva) often lack imageName while
+    // the canonical inventory path (/Lotus/Types/.../Kuva) has it. If the scanner ever
+    // returns the StoreItems path, the lookup would find no image without this fix.
+    {
+        let name_to_image: HashMap<String, String> = items.iter()
+            .filter_map(|i| i.image_name.as_ref().map(|img| (i.name.clone(), img.clone())))
+            .collect();
+        for item in items.iter_mut() {
+            if item.image_name.is_none() {
+                if let Some(img) = name_to_image.get(&item.name) {
+                    item.image_name = Some(img.clone());
+                }
+            }
+        }
+    }
+
+    // Build weapon disposition map from omegaAttenuation values already in the item list.
+    // No separate ExportWeapons.json fetch required — All.json has this field.
+    let weapon_dispositions: HashMap<String, f32> = items.iter()
+        .filter_map(|i| i.omega_attenuation.map(|d| (i.unique_name.clone(), d)))
+        .collect();
+
+    Ok(FetchResult { items, recipes, relic_drops, relic_rewards, blueprint_names, wiki_reward_names, syndicate_catalog, weapon_dispositions })
 }
 
 pub fn fallback_items() -> Vec<WfcdItem> {
@@ -1136,7 +1165,7 @@ pub fn fallback_items() -> Vec<WfcdItem> {
         unique_name: u.to_string(),
         name: n.to_string(),
         category: c.to_string(),
-        image_name: None, vaulted: None, ducats: None, mastery_req: None,
+        image_name: None, vaulted: None, ducats: None, mastery_req: None, omega_attenuation: None,
     })
     .collect()
 }

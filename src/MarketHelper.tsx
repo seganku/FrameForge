@@ -1,10 +1,17 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef, memo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { HelpTip } from "./HelpTip";
 import WfmTrading from "./WfmTrading";
 import ItemMarketPopup from "./ItemMarketPopup";
 import type { InventoryItem } from "./App";
+import polMadurai  from "./assets/polarity/madurai.svg";
+import polVazarin  from "./assets/polarity/vazarin.svg";
+import polNaramon  from "./assets/polarity/naramon.svg";
+import polZenurik  from "./assets/polarity/zenurik.svg";
+import polUnairu   from "./assets/polarity/unairu.svg";
+import polPenjaga  from "./assets/polarity/penjaga.svg";
+import polUmbra    from "./assets/polarity/umbra.svg";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -28,12 +35,31 @@ export interface MarketFilters {
   conditions: ("dupes" | "itemowned" | "fullset" | "hasparts")[];
   vault:      ("vaulted" | "unvaulted")[];
   sortMode:   "plat" | "ducats" | "az" | "za";
-  activeMarketTab: "sets" | "trading";
+  activeMarketTab: "trading" | "sets" | "mods" | "rivens" | "sisters";
 }
 export const MARKET_FILTERS_DEFAULT: MarketFilters = {
   search: "", ownership: [], conditions: [], vault: [], sortMode: "ducats",
-  activeMarketTab: "sets",
+  activeMarketTab: "trading",
 };
+
+interface BlobRivenStat { tag: string; value: number; }
+interface BlobRivenEntry {
+  item_id:   string;
+  item_type: string;
+  mod_name:  string;   // pre-computed by Rust, persisted in cache
+  /** "unrevealed" | "revealed" | "unlocked" */
+  riven_state: "unrevealed" | "revealed" | "unlocked";
+  compat:    string | null;
+  challenge_type: string | null;
+  challenge_complication: string | null;
+  lvl_req:   number | null;
+  polarity:  string | null;
+  buffs:     BlobRivenStat[];
+  curses:    BlobRivenStat[];
+  mod_rank:  number;
+  count:     number;
+  rerolls:   number;
+}
 
 interface Props {
   inventory: Record<string, InventoryItem>;
@@ -177,7 +203,9 @@ export default function MarketHelper({ inventory, refreshKey, crafting, onWfmLog
   const [prices, setPrices]               = useState<Map<string, WfmPrice>>(new Map());
   const [wfmBadge, setWfmBadge]           = useState(0);
   const [wfmUsername, setWfmUsername]     = useState<string | null>(null);
+  const [auctionRefreshKey, setAuctionRefreshKey] = useState(0);
   const [popup, setPopup] = useState<{ urlName: string; displayName: string; imageName?: string } | null>(null);
+  const [rivens, setRivens]               = useState<BlobRivenEntry[]>([]);
   const { search, ownership, conditions, vault, sortMode, activeMarketTab } = filters;
   const set = <K extends keyof MarketFilters>(k: K, v: MarketFilters[K]) => onFiltersChange({ ...filters, [k]: v });
 
@@ -203,6 +231,13 @@ export default function MarketHelper({ inventory, refreshKey, crafting, onWfmLog
     invoke("start_wfm_queue").catch(() => {});
   }, []); // eslint-disable-line
 
+  // Fetch rivens from cache whenever the tab is opened or data refreshes.
+  useEffect(() => {
+    if (activeMarketTab === "rivens") {
+      invoke<BlobRivenEntry[]>("get_rivens").then(setRivens).catch(() => {});
+    }
+  }, [activeMarketTab, refreshKey]);
+
   // Load prices already cached in inventory_state_cache (survive restarts).
   useEffect(() => {
     invoke<Record<string, number | null>>("wfm_get_cached_prices")
@@ -220,15 +255,26 @@ export default function MarketHelper({ inventory, refreshKey, crafting, onWfmLog
   }, []); // eslint-disable-line
 
   // Listen for prices arriving from the Rust queue drain thread.
+  // Batch updates with rAF so bursts of events don't cause a re-render per price.
+  const pendingPrices = useRef<Map<string, WfmPrice>>(new Map());
+  const priceRafRef   = useRef<number | null>(null);
   useEffect(() => {
     const unlisten = listen<{ url_name: string; sell_median: number | null }>(
       "wfm-price-update",
       ({ payload }) => {
-        setPrices(prev => {
-          const m = new Map(prev);
-          m.set(payload.url_name, { url_name: payload.url_name, sell_median: payload.sell_median ?? undefined });
-          return m;
-        });
+        pendingPrices.current.set(payload.url_name, { url_name: payload.url_name, sell_median: payload.sell_median ?? undefined });
+        if (!priceRafRef.current) {
+          priceRafRef.current = requestAnimationFrame(() => {
+            priceRafRef.current = null;
+            const batch = new Map(pendingPrices.current);
+            pendingPrices.current.clear();
+            setPrices(prev => {
+              const m = new Map(prev);
+              for (const [k, v] of batch) m.set(k, v);
+              return m;
+            });
+          });
+        }
       }
     );
     return () => { unlisten.then(fn => fn()); };
@@ -464,15 +510,25 @@ export default function MarketHelper({ inventory, refreshKey, crafting, onWfmLog
     <div className="market-helper">
       {/* ── Market tab strip ── */}
       <div className="market-tab-strip">
-        <button className={activeMarketTab === "sets" ? "active" : ""} onClick={() => set("activeMarketTab", "sets")}>
-          Prime Sets
-        </button>
         <button className={activeMarketTab === "trading" ? "active" : ""} onClick={() => { set("activeMarketTab", "trading"); setWfmBadge(0); }}>
           Trading {wfmBadge > 0 && <span className="market-tab-badge">{wfmBadge}</span>}
         </button>
+        <button className={activeMarketTab === "sets" ? "active" : ""} onClick={() => set("activeMarketTab", "sets")}>
+          Prime Sets
+        </button>
+        <button className={activeMarketTab === "mods" ? "active" : ""} onClick={() => set("activeMarketTab", "mods")}>
+          Mods &amp; Arcanes
+        </button>
+        <button className={activeMarketTab === "rivens" ? "active" : ""} onClick={() => set("activeMarketTab", "rivens")}>
+          Rivens
+        </button>
+        <button className={activeMarketTab === "sisters" ? "active" : ""} onClick={() => set("activeMarketTab", "sisters")}>
+          Sisters
+        </button>
       </div>
 
-      {activeMarketTab === "trading" && (
+      {/* Keep WfmTrading mounted at all times so auction/whisper state isn't lost on tab switch */}
+      <div style={{ display: activeMarketTab === "trading" ? "" : "none" }}>
         <WfmTrading
           wfmLookup={wfmLookup}
           wfmItems={wfmItems}
@@ -480,7 +536,24 @@ export default function MarketHelper({ inventory, refreshKey, crafting, onWfmLog
           inventory={inventory}
           onNewWhisper={() => { if (activeMarketTab !== "trading") setWfmBadge(n => n + 1); }}
           onLoginChange={u => setWfmUsername(u)}
+          auctionRefreshKey={auctionRefreshKey}
         />
+      </div>
+
+      {activeMarketTab === "mods" && (
+        <div className="market-placeholder">
+          <p>Mods &amp; Arcanes market coming soon.</p>
+        </div>
+      )}
+
+      {activeMarketTab === "rivens" && (
+        <RivensTab rivens={rivens} allItems={allItems} wfmUsername={wfmUsername} onAuctionPosted={() => setAuctionRefreshKey(k => k + 1)} />
+      )}
+
+      {activeMarketTab === "sisters" && (
+        <div className="market-placeholder">
+          <p>Sisters / Tenet weapons market coming soon.</p>
+        </div>
       )}
 
       {activeMarketTab === "sets" && <>
@@ -579,3 +652,760 @@ export default function MarketHelper({ inventory, refreshKey, crafting, onWfmLog
     </div>
   );
 }
+
+// ─── Rivens tab ───────────────────────────────────────────────────────────────
+
+function rivenCategory(itemType: string): string {
+  if (itemType.includes("Melee"))   return "Melee";
+  if (itemType.includes("Rifle"))   return "Rifle";
+  if (itemType.includes("Pistol") || itemType.includes("Kitgun")) return "Pistol";
+  if (itemType.includes("Shotgun")) return "Shotgun";
+  if (itemType.includes("Archgun") || itemType.includes("Archwing")) return "Arch-gun";
+  if (itemType.includes("Zaw"))     return "Zaw";
+  return "Riven";
+}
+
+// Riven stat formula — exact port of calamity-inc/warframe-riven-info RivenParser.js
+//
+// Buff:  baseCap × (1.5 × omega × 10) × 1.25^numCurses × lerp(0.9,1.1,raw/0x3FFFFFFF) × buffAtten[numBuffs] × (rank+1)
+// Curse: −baseCap × (1.5 × omega × 10) × lerp × curseAtten[numBuffs] × buffAtten[numCurses] × (rank+1)
+//
+// baseCap values are per-stat per riven type, sourced from riven_tags.json in that repo.
+// Kitgun caps == Pistol caps; Zaw caps == Melee caps — merged into PL and ME respectively.
+// Units: '%' → +X.X%; 'x' → faction damage shown as ×1.07; 'm' → meters; 's' → seconds; 'n' → flat.
+
+const BUFF_ATTEN  = [0, 1, 0.66000003, 0.5, 0.40000001, 0.34999999] as const;
+const CURSE_ATTEN = [0, 1, 0.33000001, 0.5, 1.25,       1.5       ] as const;
+
+// AG=Archgun  ME=Melee/Zaw  PL=Pistol/Kitgun  RI=Rifle  SG=Shotgun
+type RT = 'AG' | 'ME' | 'PL' | 'RI' | 'SG';
+interface RS { label: string; unit: '%' | 'x' | 'm' | 's' | 'n'; caps: Partial<Record<RT, number>> }
+const RIVEN_STAT: Record<string, RS> = {
+  // ── Melee / Zaw only ─────────────────────────────────────────────────────────
+  WeaponMeleeDamageMod:             { label: "Damage",               unit: '%', caps: { ME: 0.0183   } },
+  WeaponMeleeRangeIncMod:           { label: "Range",                unit: 'm', caps: { ME: 0.02158  } },
+  WeaponMeleeComboEfficiencyMod:    { label: "Heavy Atk Efficiency", unit: '%', caps: { ME: 0.00816  } },
+  WeaponMeleeFinisherDamageMod:     { label: "Finisher Damage",      unit: '%', caps: { ME: 0.0133   } },
+  WeaponMeleeComboInitialBonusMod:  { label: "Initial Combo",        unit: 'n', caps: { ME: 0.27224  } },
+  WeaponMeleeComboBonusOnHitMod:    { label: "Combo Count Chance",   unit: '%', caps: { ME: 0.00653  } },
+  WeaponMeleeComboPointsOnHitMod:   { label: "Combo Count Chance",   unit: '%', caps: { ME: -0.01165 } },
+  SlideAttackCritChanceMod:         { label: "Slide Crit Chance",    unit: '%', caps: { ME: 0.013334 } },
+  ComboDurationMod:                 { label: "Combo Duration",       unit: 's', caps: { ME: 0.09     } },
+  WeaponMeleeFactionDamageCorpus:   { label: "Damage to Corpus",     unit: 'x', caps: { ME: 0.005   } },
+  WeaponMeleeFactionDamageGrineer:  { label: "Damage to Grineer",    unit: 'x', caps: { ME: 0.005   } },
+  WeaponMeleeFactionDamageInfested: { label: "Damage to Infested",   unit: 'x', caps: { ME: 0.005   } },
+  // ── Ranged only ──────────────────────────────────────────────────────────────
+  WeaponDamageAmountMod:    { label: "Damage",            unit: '%', caps: { AG: 0.0111,   PL: 0.0244,   RI: 0.018333, SG: 0.0183   } },
+  WeaponFireIterationsMod:  { label: "Multishot",         unit: '%', caps: { AG: 0.0067,   PL: 0.0133,   RI: 0.01,     SG: 0.0133   } },
+  WeaponAmmoMaxMod:         { label: "Ammo Maximum",      unit: '%', caps: { AG: 0.0111,   PL: 0.01,     RI: 0.00555,  SG: 0.01     } },
+  WeaponClipMaxMod:         { label: "Magazine Capacity", unit: '%', caps: { AG: 0.0067,   PL: 0.005555, RI: 0.005555, SG: 0.005555 } },
+  WeaponReloadSpeedMod:     { label: "Reload Speed",      unit: '%', caps: { AG: 0.0111,   PL: 0.005555, RI: 0.005555, SG: 0.005555 } },
+  WeaponProjectileSpeedMod: { label: "Projectile Speed",  unit: '%', caps: {               PL: 0.01,     RI: 0.01,     SG: 0.01     } },
+  WeaponZoomFovMod:         { label: "Zoom",              unit: '%', caps: { AG: 0.006666, PL: 0.0089,   RI: 0.006666              } },
+  WeaponPunctureDepthMod:   { label: "Punch Through",     unit: 'm', caps: { AG: 0.03,     PL: 0.03,     RI: 0.03,     SG: 0.03     } },
+  WeaponRecoilReductionMod: { label: "Recoil",            unit: '%', caps: { AG: -0.01,    PL: -0.01,    RI: -0.01,    SG: -0.01    } },
+  WeaponFactionDamageCorpus:   { label: "Damage to Corpus",   unit: 'x', caps: { AG: 0.005, PL: 0.005, RI: 0.005, SG: 0.005 } },
+  WeaponFactionDamageGrineer:  { label: "Damage to Grineer",  unit: 'x', caps: { AG: 0.005, PL: 0.005, RI: 0.005, SG: 0.005 } },
+  WeaponFactionDamageInfested: { label: "Damage to Infested", unit: 'x', caps: {             PL: 0.005, RI: 0.005, SG: 0.005 } },
+  // ── All weapons ──────────────────────────────────────────────────────────────
+  WeaponCritChanceMod:          { label: "Critical Chance",     unit: '%', caps: { AG: 0.0111,  ME: 0.02,     PL: 0.016666, RI: 0.016666, SG: 0.01     } },
+  WeaponCritDamageMod:          { label: "Critical Damage",     unit: '%', caps: { AG: 0.0089,  ME: 0.01,     PL: 0.01,     RI: 0.013333, SG: 0.01     } },
+  WeaponArmorPiercingDamageMod: { label: "Puncture",            unit: '%', caps: { AG: 0.01,    ME: 0.0133,   PL: 0.01333,  RI: 0.01333,  SG: 0.01333  } },
+  WeaponImpactDamageMod:        { label: "Impact",              unit: '%', caps: { AG: 0.01,    ME: 0.0133,   PL: 0.013333, RI: 0.013333, SG: 0.013333 } },
+  WeaponSlashDamageMod:         { label: "Slash",               unit: '%', caps: { AG: 0.01,    ME: 0.0133,   PL: 0.013333, RI: 0.013333, SG: 0.013333 } },
+  WeaponElectricityDamageMod:   { label: "Electricity",         unit: '%', caps: { AG: 0.0133,  ME: 0.01,     PL: 0.01,     RI: 0.01,     SG: 0.01     } },
+  WeaponFireDamageMod:          { label: "Heat",                unit: '%', caps: { AG: 0.0133,  ME: 0.01,     PL: 0.01,     RI: 0.01,     SG: 0.01     } },
+  WeaponFreezeDamageMod:        { label: "Cold",                unit: '%', caps: { AG: 0.0133,  ME: 0.01,     PL: 0.01,     RI: 0.01,     SG: 0.01     } },
+  WeaponToxinDamageMod:         { label: "Toxin",               unit: '%', caps: { AG: 0.0133,  ME: 0.01,     PL: 0.01,     RI: 0.01,     SG: 0.01     } },
+  WeaponFireRateMod:            { label: "Fire Rate / Atk Spd", unit: '%', caps: { AG: 0.00667, ME: 0.0061,   PL: 0.0083,   RI: 0.00667,  SG: 0.01     } },
+  WeaponProcTimeMod:            { label: "Status Duration",     unit: '%', caps: { AG: 0.01111, ME: 0.01111,  PL: 0.01111,  RI: 0.01111,  SG: 0.01111  } },
+  WeaponStunChanceMod:          { label: "Status Chance",       unit: '%', caps: { AG: 0.0067,  ME: 0.01,     PL: 0.01,     RI: 0.01,     SG: 0.01     } },
+};
+
+function rivenTypeKey(category: string): RT {
+  if (category === "Arch-gun")                  return "AG";
+  if (category === "Melee" || category === "Zaw") return "ME";
+  if (category === "Shotgun")                   return "SG";
+  if (category === "Rifle")                     return "RI";
+  return "PL"; // Pistol, Kitgun, unknown
+}
+
+const RIVEN_CHALLENGE: Record<string, string> = {
+  "/Lotus/Types/Challenges/RandomizedFinisherKill":         "Kill X enemies with Finishers",
+  "/Lotus/Types/Challenges/RandomizedStyleKill":            "Kill X enemies while Sliding",
+  "/Lotus/Types/Challenges/RandomizedHeadshot":             "Kill X enemies with Headshots",
+  "/Lotus/Types/Challenges/RandomizedHeadshotUnawareBallistas": "Kill X unalerted Tusk Ballistas with a Headshot",
+  "/Lotus/Types/Challenges/RandomizedLongRangeSniper":      "Kill X enemies with Headshots from 75m+",
+  "/Lotus/Types/Challenges/RandomizedKillPassengers":       "Kill X enemies on a Dropship",
+  "/Lotus/Types/Challenges/RandomizedFisherman":            "Catch X fish without missing a throw",
+  "/Lotus/Types/Challenges/PlainsTimedVariety":             "Catch 1 fish, mine 1 gem, kill 1 enemy in 30s",
+  "/Lotus/Types/Challenges/HighPerfectDefense":             "Defense (lvl 30+) without objective taking damage",
+  "/Lotus/Types/Challenges/HighExterminationUndetected":    "Extermination (lvl 30+) undetected",
+  "/Lotus/Types/Challenges/HighSoloInterceptionHobbled":    "Solo Interception (lvl 30+) with Hobbled Key",
+  "/Lotus/Types/Challenges/HighSurvivalPacifist":           "Survival (lvl 30+) without killing anyone",
+  "/Lotus/Types/Challenges/RandomizedSkiffArcher":          "Destroy X Dargyns with a bow",
+  "/Lotus/Types/Challenges/RandomizedAntiAntiAir":          "Destroy X Vruush Turrets in Archwing",
+  "/Lotus/Types/Challenges/RandomizedFindCaches":           "Find X caches",
+  "/Lotus/Types/Challenges/RandomizedFindRareMedallions":   "Find X Syndicate Medallions",
+  "/Lotus/Types/Challenges/RandomizedHeadshotGlide":        "3 headshot kills in a single Aim Glide",
+  "/Lotus/Types/Challenges/RandomizedWallClingKillstreak":  "Kill X enemies while wall dashing/clinging",
+  "/Lotus/Types/Challenges/RandomizedKillSentients":        "Kill X Sentients",
+  "/Lotus/Types/Challenges/RandomizedKillFallingPilots":    "Kill X Dargyn Pilots before they hit the ground",
+  "/Lotus/Types/Challenges/RandomizedKill":                 "Kill X enemies",
+  "/Lotus/Types/Challenges/RandomizedFlyingHeadshotSeries": "X consecutive headshots in Archwing (Plains)",
+  "/Lotus/Types/Challenges/SustainMeleeComboThree":         "Sustain a 6x melee combo for 30 seconds",
+  "/Lotus/Types/Challenges/LimitedSynthesis":               "Synthesize a Simaris target (no traps/abilities, Hobbled Key)",
+};
+
+const RIVEN_COMPLICATION: Record<string, string> = {
+  "/Lotus/Types/Challenges/Complications/Undetected":               "while undetected",
+  "/Lotus/Types/Challenges/Complications/Sliding":                  "while sliding",
+  "/Lotus/Types/Challenges/Complications/AimGliding":               "while Aim Gliding",
+  "/Lotus/Types/Challenges/Complications/ResetOnDamageTaken":       "without taking damage",
+  "/Lotus/Types/Challenges/Complications/ResetOnDowned":            "without dying or becoming downed",
+  "/Lotus/Types/Challenges/Complications/PetPresent":               "with an active pet present",
+  "/Lotus/Types/Challenges/Complications/SentinelPresent":          "with an active sentinel present",
+  "/Lotus/Types/Challenges/Complications/SoloPlayer":               "while alone or in Solo Mode",
+  "/Lotus/Types/Challenges/Complications/ResetOnMissionFailure":    "without failing a mission",
+  "/Lotus/Types/Challenges/Complications/ResetOnAlarmRaised":       "without raising any alarms",
+  "/Lotus/Types/Challenges/Complications/ResetOnDisrupt":           "without being disrupted by Magnetic Damage",
+  "/Lotus/Types/Challenges/Complications/ResetOnProc":              "without getting afflicted by a Status Effect",
+  "/Lotus/Types/Challenges/Complications/ResetOnAllyDowned":        "without an ally becoming downed",
+  "/Lotus/Types/Challenges/Complications/Invisible":                "while invisible",
+  "/Lotus/Types/Challenges/Complications/EquippedDamageDebuffKey":  "with an Extinguished Dragon Key",
+  "/Lotus/Types/Challenges/Complications/EquippedHealthDebuffKey":  "with a Bleeding Dragon Key",
+  "/Lotus/Types/Challenges/Complications/EquippedShieldDebuffKey":  "with a Decaying Dragon Key",
+  "/Lotus/Types/Challenges/Complications/EquippedSpeedDebuffKey":   "with a Hobbled Dragon Key",
+  "/Lotus/Types/Challenges/Complications/ResetOnGearCipher":        "without using ciphers",
+  "/Lotus/Types/Challenges/Complications/ResetOnGearAirSupport":    "without using air support",
+  "/Lotus/Types/Challenges/Complications/ResetOnGearHealthRestores":"without using health consumables",
+  "/Lotus/Types/Challenges/Complications/ResetOnGearShieldRestores":"without using shield-restoring consumables",
+  "/Lotus/Types/Challenges/Complications/ResetOnGearAmmoRestores":  "without using ammo consumables",
+  "/Lotus/Types/Challenges/Complications/ResetOnGearEnergyRestores":"without using energy consumables",
+  "/Lotus/Types/Challenges/Complications/ResetOnNewDay":            "in one day",
+};
+
+function formatChallengeName(type: string | null, complication: string | null): string {
+  const challenge = type
+    ? (RIVEN_CHALLENGE[type] ?? (type.split("/").pop()?.replace(/([A-Z])/g, " $1").trim() ?? "Unknown challenge"))
+    : "Unknown challenge";
+  if (!complication) return challenge;
+  const comp = RIVEN_COMPLICATION[complication] ?? (complication.split("/").pop()?.replace(/([A-Z])/g, " $1").trim() ?? "");
+  return comp ? `${challenge}, ${comp}` : challenge;
+}
+
+// Riven name prefix/suffix words per stat tag (from Warframe wiki naming table).
+const RIVEN_NAME_PARTS: Record<string, { p: string; s: string }> = {
+  WeaponMeleeComboBonusOnHitMod:    { p: "Laci",  s: "Nus"  },
+  WeaponMeleeComboPointsOnHitMod:   { p: "Laci",  s: "Nus"  },
+  WeaponAmmoMaxMod:                 { p: "Ampi",  s: "Bin"  },
+  WeaponMeleeFactionDamageCorpus:   { p: "Manti", s: "Tron" },
+  WeaponFactionDamageCorpus:        { p: "Manti", s: "Tron" },
+  WeaponMeleeFactionDamageGrineer:  { p: "Argi",  s: "Con"  },
+  WeaponFactionDamageGrineer:       { p: "Argi",  s: "Con"  },
+  WeaponMeleeFactionDamageInfested: { p: "Pura",  s: "Ada"  },
+  WeaponFactionDamageInfested:      { p: "Pura",  s: "Ada"  },
+  WeaponFreezeDamageMod:            { p: "Geli",  s: "Do"   },
+  ComboDurationMod:                 { p: "Tempi", s: "Nem"  },
+  WeaponCritChanceMod:              { p: "Crita", s: "Cron" },
+  SlideAttackCritChanceMod:         { p: "Pleci", s: "Nent" },
+  WeaponCritDamageMod:              { p: "Acri",  s: "Tis"  },
+  WeaponDamageAmountMod:            { p: "Visi",  s: "Ata"  },
+  WeaponMeleeDamageMod:             { p: "Visi",  s: "Ata"  },
+  WeaponElectricityDamageMod:       { p: "Vexi",  s: "Tio"  },
+  WeaponFireDamageMod:              { p: "Igni",  s: "Pha"  },
+  WeaponMeleeFinisherDamageMod:     { p: "Exi",   s: "Cta"  },
+  WeaponFireRateMod:                { p: "Croni", s: "Dra"  },
+  WeaponProjectileSpeedMod:         { p: "Conci", s: "Nak"  },
+  WeaponMeleeComboInitialBonusMod:  { p: "Para",  s: "Um"   },
+  WeaponImpactDamageMod:            { p: "Magna", s: "Ton"  },
+  WeaponClipMaxMod:                 { p: "Arma",  s: "Tin"  },
+  WeaponMeleeComboEfficiencyMod:    { p: "Forti", s: "Us"   },
+  WeaponFireIterationsMod:          { p: "Sati",  s: "Can"  },
+  WeaponToxinDamageMod:             { p: "Toxi",  s: "Tox"  },
+  WeaponPunctureDepthMod:           { p: "Lexi",  s: "Nok"  },
+  WeaponArmorPiercingDamageMod:     { p: "Insi",  s: "Cak"  },
+  WeaponReloadSpeedMod:             { p: "Feva",  s: "Tak"  },
+  WeaponMeleeRangeIncMod:           { p: "Locti", s: "Tor"  },
+  WeaponSlashDamageMod:             { p: "Sci",   s: "Sus"  },
+  WeaponStunChanceMod:              { p: "Hexa",  s: "Dex"  },
+  WeaponProcTimeMod:                { p: "Deci",  s: "Des"  },
+  WeaponRecoilReductionMod:         { p: "Zeti",  s: "Mag"  },
+  WeaponZoomFovMod:                 { p: "Hera",  s: "Lis"  },
+};
+
+// Compute the deterministic riven mod name from its stats.
+// Only buffs (positive stats) determine the name — curses are ignored.
+// 1 buff  → CoreSuffix         (buff's prefix word + buff's suffix word)
+// 2 buffs → CoreSuffix         (higher's prefix + lower's suffix, no dash)
+// 3 buffs → Prefix-CoreSuffix  (highest's prefix - second's prefix + lowest's suffix)
+// Returns lowercase (WFM format); capitalize first letter for display.
+function rivenModName(riven: BlobRivenEntry): string {
+  if (riven.buffs.length === 0) return "";
+  const sorted = [...riven.buffs].sort((a, b) => b.value - a.value);
+  const hi  = RIVEN_NAME_PARTS[sorted[0].tag];
+  const lo  = RIVEN_NAME_PARTS[sorted[sorted.length - 1].tag];
+  if (!hi || !lo) return "";
+  const suffix = lo.s.toLowerCase();
+  if (sorted.length >= 3) {
+    const mid = RIVEN_NAME_PARTS[sorted[1].tag];
+    if (mid) return `${hi.p.toLowerCase()}-${mid.p.toLowerCase()}${suffix}`;
+  }
+  // 1-2 buffs: core word from highest buff, suffix word from lowest buff — no dash.
+  return `${hi.p.toLowerCase()}${suffix}`;
+}
+
+function rivenStatLabel(stat: BlobRivenStat, positive: boolean, disposition: number, category: string, numBuffs: number, numCurses: number, rank: number): string {
+  const frac  = stat.value / 0x3FFFFFFF; // 1073741823 — matches RivenParser.js rivenIntToFloat
+  const roll  = 0.9 + frac * 0.2;
+  const entry = RIVEN_STAT[stat.tag];
+  const label = entry?.label ?? stat.tag;
+  const rt    = rivenTypeKey(category);
+
+  const baseCap = entry?.caps[rt] ?? null;
+  if (baseCap === null) {
+    const sign = positive ? "+" : "-";
+    return `${sign}${(frac * 100).toFixed(1)}% ${label}`;
+  }
+
+  const nb    = Math.min(numBuffs, BUFF_ATTEN.length - 1);
+  const nc    = Math.min(numCurses, BUFF_ATTEN.length - 1);
+  const atten = 1.5 * disposition * 10; // SPECIFIC_FIT_ATTENUATION × omega × base_drain
+
+  const v = positive
+    ? baseCap * atten * Math.pow(1.25, numCurses) * roll * BUFF_ATTEN[nb] * (rank + 1)
+    : -(baseCap * atten * roll * CURSE_ATTEN[nb] * BUFF_ATTEN[nc] * (rank + 1));
+
+  const s = v >= 0 ? "+" : ""; // negative values carry their own sign
+  switch (entry!.unit) {
+    case '%': return `${s}${(v * 100).toFixed(1)}% ${label}`;
+    case 'x': return `x${(1 + v).toFixed(2)} ${label}`;
+    case 'm': return `${s}${v.toFixed(1)}m ${label}`;
+    case 's': return `${s}${v.toFixed(1)}s ${label}`;
+    case 'n': return `${s}${Math.round(v)} ${label}`;
+  }
+}
+
+// ── WFM riven auction helpers ─────────────────────────────────────────────────
+
+// Internal stat tag → warframe.market v1 attribute url_name.
+// Names from real auction data via /v1/auctions/search — WFM no longer uses
+// trailing underscores; combined stats use the "_/_" separator.
+const RIVEN_WFM_ATTR: Record<string, string> = {
+  // ── Melee / Zaw ──────────────────────────────────────────────────────────────
+  WeaponMeleeDamageMod:             "base_damage_/_melee_damage",
+  WeaponMeleeRangeIncMod:           "range",
+  WeaponMeleeComboEfficiencyMod:    "channeling_efficiency",      // WFM still uses old "channeling" name
+  WeaponMeleeFinisherDamageMod:     "finisher_damage",
+  WeaponMeleeComboInitialBonusMod:  "initial_combo",
+  WeaponMeleeComboBonusOnHitMod:    "chance_to_gain_extra_combo_count", // "Additional Combo Count Chance" on WFM
+  WeaponMeleeComboPointsOnHitMod:   "chance_to_gain_combo_count",
+  SlideAttackCritChanceMod:         "critical_chance_on_slide_attack",
+  ComboDurationMod:                 "combo_duration",
+  WeaponMeleeFactionDamageCorpus:   "damage_vs_corpus",
+  WeaponMeleeFactionDamageGrineer:  "damage_vs_grineer",
+  WeaponMeleeFactionDamageInfested: "damage_vs_infested",
+  // ── Ranged ───────────────────────────────────────────────────────────────────
+  WeaponDamageAmountMod:            "base_damage_/_melee_damage",
+  WeaponFireIterationsMod:          "multishot",
+  WeaponAmmoMaxMod:                 "ammo_maximum",
+  WeaponClipMaxMod:                 "magazine_capacity",
+  WeaponReloadSpeedMod:             "reload_speed",
+  WeaponProjectileSpeedMod:         "projectile_speed",
+  WeaponZoomFovMod:                 "zoom",
+  WeaponPunctureDepthMod:           "punch_through",
+  WeaponRecoilReductionMod:         "recoil",
+  WeaponFactionDamageCorpus:        "damage_vs_corpus",
+  WeaponFactionDamageGrineer:       "damage_vs_grineer",
+  WeaponFactionDamageInfested:      "damage_vs_infested",
+  // ── All weapons ──────────────────────────────────────────────────────────────
+  WeaponCritChanceMod:              "critical_chance",
+  WeaponCritDamageMod:              "critical_damage",
+  WeaponArmorPiercingDamageMod:     "puncture_damage",
+  WeaponImpactDamageMod:            "impact_damage",
+  WeaponSlashDamageMod:             "slash_damage",
+  WeaponElectricityDamageMod:       "electricity_damage",
+  WeaponFireDamageMod:              "heat_damage",
+  WeaponFreezeDamageMod:            "cold_damage",
+  WeaponToxinDamageMod:             "toxin_damage",
+  WeaponFireRateMod:                "fire_rate_/_attack_speed",
+  WeaponProcTimeMod:                "status_duration",
+  WeaponStunChanceMod:              "status_chance",
+};
+
+// WFM's combined attributes cover both melee and ranged with a single url_name,
+// so no category-specific overrides are needed.
+function rivenWfmAttr(tag: string, _category: string): string | undefined {
+  return RIVEN_WFM_ATTR[tag];
+}
+
+// Stats WFM classifies as negative-only regardless of how the game labels them.
+// These must always be sent as positive:false with a negative value.
+const WFM_NEGATIVE_ONLY = new Set<string>([]);
+
+// Warframe inventory polarity IDs → WFM polarity names
+function wfmPolarity(pol: string | null): string {
+  const MAP: Record<string, string> = {
+    AP_ATTACK:  "madurai",
+    AP_DEFENSE: "vazarin",
+    AP_TACTIC:  "naramon",
+    AP_WARD:    "unairu",
+    AP_POWER:   "zenurik",
+    AP_UMBRA:   "umbra",
+    AP_PRECEPT: "penjaga",
+  };
+  return MAP[pol ?? ""] ?? "madurai";
+}
+
+// Polarity display: icon + human name
+const POLARITY_DISPLAY: Record<string, { icon: string; name: string }> = {
+  AP_ATTACK:  { icon: polMadurai,  name: "Madurai"  },
+  AP_DEFENSE: { icon: polVazarin,  name: "Vazarin"  },
+  AP_TACTIC:  { icon: polNaramon,  name: "Naramon"  },
+  AP_WARD:    { icon: polUnairu,   name: "Unairu"   },
+  AP_POWER:   { icon: polZenurik,  name: "Zenurik"  },
+  AP_UMBRA:   { icon: polUmbra,    name: "Umbra"    },
+  AP_PRECEPT: { icon: polPenjaga,  name: "Penjaga"  },
+};
+
+// Display name → WFM URL slug (mirrors to_wfm_slug in Rust)
+function toWfmSlug(name: string): string {
+  return name.toLowerCase().replace(/['']/g, "").replace(/&/g, "and").replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+}
+
+// Compute the signed numeric value used for WFM auction attributes.
+// WFM format: % stats → signed percentage (9.5 buff, -6.0 curse); x stats → full multiplier (1.07 buff).
+function rivenStatWfmValue(
+  stat: BlobRivenStat, positive: boolean,
+  disposition: number, category: string,
+  numBuffs: number, numCurses: number, rank: number
+): number {
+  const frac  = stat.value / 0x3FFFFFFF;
+  const roll  = 0.9 + frac * 0.2;
+  const entry = RIVEN_STAT[stat.tag];
+  const rt    = rivenTypeKey(category);
+  const baseCap = entry?.caps[rt];
+
+  if (!baseCap || !entry) return parseFloat((frac * 100 * (positive ? 1 : -1)).toFixed(1));
+
+  const nb    = Math.min(numBuffs, BUFF_ATTEN.length - 1);
+  const nc    = Math.min(numCurses, BUFF_ATTEN.length - 1);
+  const atten = 1.5 * disposition * 10;
+
+  const v = positive
+    ? baseCap * atten * Math.pow(1.25, numCurses) * roll * BUFF_ATTEN[nb] * (rank + 1)
+    : -(baseCap * atten * roll * CURSE_ATTEN[nb] * BUFF_ATTEN[nc] * (rank + 1));
+
+  // v is positive for buffs, negative for curses
+  switch (entry.unit) {
+    case '%': return parseFloat((v * 100).toFixed(1));       // e.g. 9.5 or -6.0
+    case 'x': return parseFloat((1 + Math.abs(v)).toFixed(2)); // WFM: full multiplier 1.07 (faction dmg only ever a buff)
+    case 'm': return parseFloat(v.toFixed(2));
+    case 's': return parseFloat(v.toFixed(1));
+    case 'n': return Math.round(v);
+  }
+}
+
+// ── Veiled riven WFM URL names (regular sell orders, not auctions) ────────────
+const VEILED_WFM_SLUG: Record<string, string> = {
+  "Rifle":   "rifle_riven_mod",
+  "Pistol":  "pistol_riven_mod",
+  "Melee":   "melee_riven_mod",
+  "Shotgun": "shotgun_riven_mod",
+  "Arch-gun":"archgun_riven_mod",
+  "Zaw":     "zaw_riven_mod",
+};
+
+// ── Sell modal for UNVEILED rivens (WFM auction) ──────────────────────────────
+
+interface SellModalProps {
+  riven:      BlobRivenEntry;
+  weaponName: string;
+  disposition: number;
+  category:   string;
+  onClose:    () => void;
+  onSuccess:  () => void;
+}
+
+function RivenSellModal({ riven, weaponName, disposition, category, onClose, onSuccess }: SellModalProps) {
+  const [saleType,    setSaleType]    = useState<"auction" | "direct">("auction");
+  const [startPrice,  setStartPrice]  = useState("100");
+  const [buyoutPrice, setBuyoutPrice] = useState("");
+  const [directPrice, setDirectPrice] = useState("100");
+  const [minRep,      setMinRep]      = useState("0");
+  const [note,        setNote]        = useState("");
+  const [visible,     setVisible]     = useState(true);
+  const [busy,        setBusy]        = useState(false);
+  const [error,       setError]       = useState<string | null>(null);
+
+  const attrs = [
+    ...riven.buffs.map(b => {
+      const url_name = rivenWfmAttr(b.tag, category);
+      const isNegOnly = !!(url_name && WFM_NEGATIVE_ONLY.has(url_name));
+      // Always compute via buff formula; negate result if WFM requires negative-only
+      const rawValue = rivenStatWfmValue(b, true, disposition, category, riven.buffs.length, riven.curses.length, riven.mod_rank);
+      return { url_name, positive: !isNegOnly, value: isNegOnly ? -Math.abs(rawValue) : rawValue };
+    }),
+    ...riven.curses.map(c => ({
+      url_name: rivenWfmAttr(c.tag, category),
+      positive: false,
+      value: rivenStatWfmValue(c, false, disposition, category, riven.buffs.length, riven.curses.length, riven.mod_rank),
+    })),
+  ];
+  const unmapped = attrs.filter(a => !a.url_name);
+  const validAttrs = attrs.filter(a => !!a.url_name);
+
+  async function handleSubmit() {
+    let sp: number, bp: number | null;
+    if (saleType === "direct") {
+      const p = parseInt(directPrice, 10);
+      if (!p || p < 1) { setError("Selling price must be at least 1 platinum."); return; }
+      sp = p; bp = p;
+    } else {
+      sp = parseInt(startPrice, 10);
+      if (!sp || sp < 1) { setError("Starting price must be at least 1 platinum."); return; }
+      const bpRaw = buyoutPrice.trim() ? parseInt(buyoutPrice, 10) : undefined;
+      if (bpRaw !== undefined && bpRaw < sp) { setError("Buyout price must be ≥ starting price."); return; }
+      bp = bpRaw ?? null;
+    }
+    setBusy(true);
+    setError(null);
+    const computedName = riven.mod_name || rivenModName(riven);
+    try {
+      await invoke("wfm_create_riven_auction", {
+        weaponUrlName:       toWfmSlug(weaponName),
+        rivenName:           computedName,
+        masteryLevel:        riven.lvl_req ?? 0,
+        modRank:             riven.mod_rank,
+        reRolls:             riven.rerolls,
+        polarity:            wfmPolarity(riven.polarity),
+        attributes:          validAttrs,
+        startingPrice:       sp,
+        buyoutPrice:         bp,
+        minimalReputation:   saleType === "direct" ? 0 : (parseInt(minRep, 10) || 0),
+        note,
+        visible,
+      });
+      onSuccess();
+      onClose();
+    } catch (e: unknown) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="riven-modal-overlay" onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="riven-modal">
+        <div className="riven-modal-title">
+          Post Riven Auction
+          <button className="riven-modal-close" onClick={onClose}>×</button>
+        </div>
+
+        <div>
+          <div className="riven-modal-weapon">{weaponName}{(() => { const mn = (riven.mod_name || rivenModName(riven)); return mn ? <> <span className="riven-mod-name">{mn.replace(/^./, c => c.toUpperCase())}</span></> : null; })()}</div>
+          <div className="riven-modal-meta">{category} · MR {riven.lvl_req ?? "?"} · Rank {riven.mod_rank} · {disposition.toFixed(2)}x · {riven.rerolls} roll{riven.rerolls !== 1 ? "s" : ""}{riven.polarity && POLARITY_DISPLAY[riven.polarity] ? <> · <img src={POLARITY_DISPLAY[riven.polarity].icon} className="polarity-icon" alt={POLARITY_DISPLAY[riven.polarity].name} /> {POLARITY_DISPLAY[riven.polarity].name}</> : ""}</div>
+        </div>
+
+        <div className="riven-modal-stats">
+          {riven.buffs.map((b, i) => (
+            <span key={i} className="riven-stat riven-buff">{rivenStatLabel(b, true, disposition, category, riven.buffs.length, riven.curses.length, riven.mod_rank)}</span>
+          ))}
+          {riven.curses.map((c, i) => (
+            <span key={i} className="riven-stat riven-curse">{rivenStatLabel(c, false, disposition, category, riven.buffs.length, riven.curses.length, riven.mod_rank)}</span>
+          ))}
+        </div>
+
+        {unmapped.length > 0 && (
+          <div className="riven-modal-warn">
+            {unmapped.length} stat{unmapped.length > 1 ? "s" : ""} have no WFM attribute mapping and will be omitted from the listing.
+          </div>
+        )}
+
+        <hr className="riven-modal-divider" />
+
+        <div className="riven-modal-row">
+          <span className="riven-modal-label">Type</span>
+          <div className="riven-sale-type">
+            <button className={`riven-sale-type-btn${saleType === "auction" ? " active" : ""}`}
+              onClick={() => setSaleType("auction")}>Auction</button>
+            <button className={`riven-sale-type-btn${saleType === "direct" ? " active" : ""}`}
+              onClick={() => setSaleType("direct")}>Direct Sale</button>
+          </div>
+        </div>
+
+        {saleType === "direct" ? (
+          <div className="riven-modal-row">
+            <span className="riven-modal-label">Selling price (plat)</span>
+            <input className="riven-modal-input" type="number" min={1} value={directPrice}
+              onChange={e => setDirectPrice(e.target.value)} />
+          </div>
+        ) : (<>
+          <div className="riven-modal-row">
+            <span className="riven-modal-label">Starting price (plat)</span>
+            <input className="riven-modal-input" type="number" min={1} value={startPrice}
+              onChange={e => setStartPrice(e.target.value)} />
+          </div>
+          <div className="riven-modal-row">
+            <span className="riven-modal-label">Buyout price (opt.)</span>
+            <input className="riven-modal-input" type="number" min={1} placeholder="—"
+              value={buyoutPrice} onChange={e => setBuyoutPrice(e.target.value)} />
+          </div>
+          <div className="riven-modal-row">
+            <span className="riven-modal-label">Min. reputation</span>
+            <input className="riven-modal-input" type="number" min={0} max={5} value={minRep}
+              onChange={e => setMinRep(e.target.value)} />
+          </div>
+        </>)}
+
+        <div className="riven-modal-row">
+          <span className="riven-modal-label">Note (optional)</span>
+          <textarea className="riven-modal-input riven-modal-note" value={note}
+            onChange={e => setNote(e.target.value)} />
+        </div>
+        <div className="riven-modal-row riven-modal-row-toggle">
+          <span className="riven-modal-label">Visible on WFM</span>
+          <label className="riven-toggle">
+            <input type="checkbox" checked={visible} onChange={e => setVisible(e.target.checked)} />
+            <span className="riven-toggle-track"><span className="riven-toggle-thumb" /></span>
+            <span className="riven-toggle-label">{visible ? "Visible" : "Hidden"}</span>
+          </label>
+        </div>
+
+        {error && <div className="riven-modal-error">{error}</div>}
+
+        <button className="riven-modal-submit" onClick={handleSubmit} disabled={busy}>
+          {busy ? "Posting…" : saleType === "direct" ? "Post Direct Sale on warframe.market" : "Post Auction on warframe.market"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Sell modal for VEILED rivens (WFM regular sell order) ─────────────────────
+
+interface VeiledSellModalProps {
+  category: string;
+  count:    number;
+  onClose:  () => void;
+  onSuccess: () => void;
+}
+
+function VeiledSellModal({ category, count, onClose, onSuccess }: VeiledSellModalProps) {
+  const [price,    setPrice]    = useState("20");
+  const [quantity, setQuantity] = useState(String(Math.min(count, 1)));
+  const [busy,     setBusy]     = useState(false);
+  const [error,    setError]    = useState<string | null>(null);
+
+  const slug = VEILED_WFM_SLUG[category];
+
+  async function handleSubmit() {
+    const plat = parseInt(price, 10);
+    const qty  = parseInt(quantity, 10);
+    if (!plat || plat < 1) { setError("Price must be at least 1 platinum."); return; }
+    if (!qty  || qty  < 1) { setError("Quantity must be at least 1."); return; }
+    if (!slug) { setError(`No WFM listing found for ${category} Riven Mod.`); return; }
+    setBusy(true);
+    setError(null);
+    try {
+      const info = await invoke<{ item: { id: string } }>("wfm_get_item_info", { urlName: slug });
+      const itemId = info?.item?.id ?? (info as Record<string, Record<string, string>>)?.["data"]?.["id"];
+      if (!itemId) throw new Error("Could not find WFM item ID for this riven type.");
+      await invoke("wfm_create_order", { itemId, orderType: "sell", platinum: plat, quantity: qty });
+      onSuccess();
+      onClose();
+    } catch (e: unknown) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="riven-modal-overlay" onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="riven-modal">
+        <div className="riven-modal-title">
+          Sell Unrevealed Riven
+          <button className="riven-modal-close" onClick={onClose}>×</button>
+        </div>
+
+        <div>
+          <div className="riven-modal-weapon">{category} Riven Mod (Unrevealed)</div>
+          <div className="riven-modal-meta">{count} in inventory</div>
+        </div>
+
+        <hr className="riven-modal-divider" />
+
+        <div className="riven-modal-row">
+          <span className="riven-modal-label">Price per riven (plat)</span>
+          <input className="riven-modal-input" type="number" min={1} value={price}
+            onChange={e => setPrice(e.target.value)} />
+        </div>
+        <div className="riven-modal-row">
+          <span className="riven-modal-label">Quantity to list</span>
+          <input className="riven-modal-input" type="number" min={1} max={count} value={quantity}
+            onChange={e => setQuantity(e.target.value)} />
+        </div>
+
+        {!slug && (
+          <div className="riven-modal-warn">This riven type may not be individually listable on warframe.market.</div>
+        )}
+        {error && <div className="riven-modal-error">{error}</div>}
+
+        <button className="riven-modal-submit" onClick={handleSubmit} disabled={busy || !slug}>
+          {busy ? "Listing…" : "Create Sell Order on warframe.market"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+
+const RivensTab = memo(function RivensTab({ rivens, allItems, wfmUsername, onAuctionPosted }: {
+  rivens: BlobRivenEntry[];
+  allItems: CatalogItem[];
+  wfmUsername: string | null;
+  onAuctionPosted?: () => void;
+}) {
+  const [dispositions, setDispositions] = useState<Record<string, number>>({});
+  const [sellTarget,   setSellTarget]   = useState<BlobRivenEntry | null>(null);
+  const [sellVeiled,   setSellVeiled]   = useState<BlobRivenEntry | null>(null);
+
+  useEffect(() => {
+    invoke<Record<string, number>>("get_weapon_dispositions")
+      .then(setDispositions)
+      .catch(() => {});
+  }, []);
+
+  const pathToName = useMemo(() => {
+    const m: Record<string, string> = {};
+    for (const it of allItems) m[it.unique_name] = it.name;
+    return m;
+  }, [allItems]);
+
+  if (rivens.length === 0) {
+    return (
+      <div className="market-placeholder">
+        <p>No rivens found. Inventory blob must be captured at least once while Warframe is running.</p>
+      </div>
+    );
+  }
+
+  const unrevealed = rivens.filter(r => r.riven_state === "unrevealed");
+  const revealed   = rivens.filter(r => r.riven_state === "revealed");
+  const unlocked   = rivens.filter(r => r.riven_state === "unlocked" || (!r.riven_state && r.compat !== null));
+
+  const sellTargetWeaponName = sellTarget?.compat
+    ? (pathToName[sellTarget.compat] ?? sellTarget.compat.split("/").pop() ?? sellTarget.compat)
+    : "";
+  const sellTargetDisp = sellTarget?.compat ? (dispositions[sellTarget.compat] ?? 1.0) : 1.0;
+  const sellTargetCat  = sellTarget ? rivenCategory(sellTarget.item_type) : "";
+
+  return (
+    <div className="rivens-tab">
+
+
+      {unlocked.length > 0 && (
+        <section>
+          <div className="rivens-section-header">Riven ({unlocked.length})</div>
+          <div className="rivens-list">
+            {unlocked.map((r, i) => {
+              const weaponName = r.compat ? (pathToName[r.compat] ?? r.compat.split("/").pop() ?? r.compat) : "Unknown";
+              const disp = r.compat ? (dispositions[r.compat] ?? 1.0) : 1.0;
+              const cat  = rivenCategory(r.item_type);
+              return (
+                <div key={r.item_id || i} className="riven-card">
+                  <div className="riven-card-header">
+                    <span className="riven-weapon">{weaponName}{(() => { const mn = (r.mod_name || rivenModName(r)); return mn ? <> <span className="riven-mod-name">{mn.replace(/^./, c => c.toUpperCase())}</span></> : null; })()}</span>
+                    <button className="riven-sell-btn" title={wfmUsername ? "Post auction on warframe.market" : "Login to WFM to sell"}
+                      onClick={() => { if (wfmUsername) setSellTarget(r); else alert("Log in to warframe.market first (Market → Trading tab)."); }}>
+                      Sell ↗
+                    </button>
+                  </div>
+                  <div className="riven-card-meta">
+                    <span>{cat}</span>
+                    <span>MR {r.lvl_req ?? "?"}</span>
+                    <span>Rank {r.mod_rank}</span>
+                    <span>{disp.toFixed(2)}x</span>
+                    <span>{r.rerolls} roll{r.rerolls !== 1 ? "s" : ""}</span>
+                    {r.polarity && POLARITY_DISPLAY[r.polarity] && (
+                      <span className="riven-polarity"><img src={POLARITY_DISPLAY[r.polarity].icon} className="polarity-icon" alt={POLARITY_DISPLAY[r.polarity].name} /> {POLARITY_DISPLAY[r.polarity].name}</span>
+                    )}
+                  </div>
+                  <div className="riven-stats">
+                    {r.buffs.map((b, j) => (
+                      <span key={j} className="riven-stat riven-buff">{rivenStatLabel(b, true, disp, cat, r.buffs.length, r.curses.length, r.mod_rank)}</span>
+                    ))}
+                    {r.curses.map((c, j) => (
+                      <span key={j} className="riven-stat riven-curse">{rivenStatLabel(c, false, disp, cat, r.buffs.length, r.curses.length, r.mod_rank)}</span>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
+      {revealed.length > 0 && (
+        <section>
+          <div className="rivens-section-header">Revealed Riven ({revealed.length})</div>
+          <div className="rivens-list">
+            {revealed.map((r, i) => {
+              const cat = rivenCategory(r.item_type);
+              const challenge = formatChallengeName(r.challenge_type, r.challenge_complication);
+              return (
+                <div key={r.item_id || i} className="riven-card riven-revealed">
+                  <div className="riven-card-header">
+                    <span className="riven-weapon">{cat} Riven Mod</span>
+                    <span className="riven-meta riven-challenge">{challenge}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
+      {unrevealed.length > 0 && (
+        <section>
+          <div className="rivens-section-header">Unrevealed Riven ({unrevealed.reduce((s, r) => s + r.count, 0)})</div>
+          <div className="rivens-list">
+            {unrevealed.map((r, i) => (
+              <div key={i} className="riven-card riven-veiled">
+                <div className="riven-card-header">
+                  <span className="riven-weapon">{rivenCategory(r.item_type)} Riven Mod</span>
+                  {r.count > 1 && <span className="riven-meta">×{r.count}</span>}
+                  <button className="riven-sell-btn" title={wfmUsername ? "List sell order on warframe.market" : "Login to WFM to sell"}
+                    onClick={() => { if (wfmUsername) setSellVeiled(r); else alert("Log in to warframe.market first (Market → Trading tab)."); }}>
+                    Sell ↗
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {sellTarget && (
+        <RivenSellModal
+          riven={sellTarget}
+          weaponName={sellTargetWeaponName}
+          disposition={sellTargetDisp}
+          category={sellTargetCat}
+          onClose={() => setSellTarget(null)}
+          onSuccess={() => setTimeout(() => onAuctionPosted?.(), 1500)}
+        />
+      )}
+      {sellVeiled && (
+        <VeiledSellModal
+          category={rivenCategory(sellVeiled.item_type)}
+          count={sellVeiled.count}
+          onClose={() => setSellVeiled(null)}
+          onSuccess={() => {}}
+        />
+      )}
+    </div>
+  );
+});

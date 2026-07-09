@@ -44,6 +44,8 @@ pub struct AppState {
     pub blueprint_to_result: Mutex<HashMap<String, (String, Option<u32>)>>,
     /// Canonical relic reward display names from the Warframe Wiki (lower-cased).
     pub wiki_reward_names: Mutex<std::collections::HashSet<String>>,
+    /// weapon unique_name → riven disposition (omegaAttenuation). Populated from All.json.
+    pub weapon_dispositions: Mutex<HashMap<String, f32>>,
     /// Last-known quantities from memory scans. Shared with monitor thread.
     pub current_quantities: Arc<Mutex<HashMap<String, i64>>>,
     /// Stable unique items (weapons/warframes) seen in 2+ consecutive scans.
@@ -61,6 +63,9 @@ pub struct AppState {
     /// When true, save a timestamped inventory blob to blobs/ on each full scan pass.
     pub blob_log_enabled: Arc<AtomicBool>,
     pub blob_log_dir: PathBuf,
+    /// When true, save the raw DE API response to api_logs/ on each fetch.
+    pub api_log_enabled: Arc<AtomicBool>,
+    pub api_log_dir: PathBuf,
     /// WFM slug → median sell price (None = item not listed on WFM). Arc so the queue thread can share it.
     pub wfm_price_cache: Arc<Mutex<HashMap<String, Option<u32>>>>,
     /// Active WFM session (JWT + username). Held in memory only, never written to disk.
@@ -76,6 +81,9 @@ pub struct AppState {
     /// syndicate name → purchasable items (all known syndicates)
     pub syndicate_catalog: Mutex<HashMap<String, Vec<SyndicateOffer>>>,
     pub syndicate_catalog_path: PathBuf,
+    /// IDs of riven auctions created via FrameForge — persisted so hidden auctions survive restarts.
+    pub auction_ids: Mutex<Vec<String>>,
+    pub auction_ids_path: PathBuf,
     /// Companion API quantities held in memory so the scanner includes them in cache writes.
     pub api_quantities_cache: Arc<Mutex<HashMap<String, i64>>>,
     /// Companion API mod copies held in memory so the scanner includes them in cache writes.
@@ -93,11 +101,27 @@ pub struct WfmSession {
     pub device_id: String,
     pub username: String,
     pub status: String,   // "online" | "ingame" | "invisible" | "offline"
+    /// v1 JWT captured from the Authorization response header during signin.
+    /// v1 endpoints (/v1/auctions/create etc.) require this; they reject v2 OAuth Bearer tokens.
+    #[serde(default)]
+    pub v1_jwt: String,
+    /// CSRF token from the page <meta name="csrf-token"> captured after login.
+    /// Required as x-csrftoken header on mutating WFM API calls (PUT, DELETE).
+    #[serde(default)]
+    pub csrf_token: String,
 }
 
 impl WfmSession {
     pub fn auth_header(&self) -> String {
         format!("Bearer {}", self.access_token)
+    }
+    /// Auth header for v1 WFM endpoints. WFM v1 uses "JWT <token>" scheme, not Bearer.
+    pub fn v1_auth_header(&self) -> String {
+        if !self.v1_jwt.is_empty() {
+            format!("JWT {}", self.v1_jwt)
+        } else {
+            format!("Bearer {}", self.access_token)
+        }
     }
 }
 
@@ -371,7 +395,7 @@ async fn fetch_item_list(state: State<'_, AppState>) -> Result<usize, String> {
     if let Ok(json) = serde_json::to_string(&result.items.iter().map(|i| serde_json::json!({
         "unique_name": i.unique_name, "name": i.name, "category": i.category,
         "image_name": i.image_name, "vaulted": i.vaulted, "ducats": i.ducats,
-        "mastery_req": i.mastery_req
+        "mastery_req": i.mastery_req, "omega_attenuation": i.omega_attenuation
     })).collect::<Vec<_>>()) {
         let _ = std::fs::write(&state.items_cache_path, json);
     }
@@ -397,6 +421,9 @@ async fn fetch_item_list(state: State<'_, AppState>) -> Result<usize, String> {
     *state.relic_drops.lock().map_err(|e| e.to_string())? = result.relic_drops;
     *state.relic_rewards.lock().map_err(|e| e.to_string())? = result.relic_rewards;
     *state.blueprint_to_result.lock().map_err(|e| e.to_string())? = result.blueprint_names;
+    if !result.weapon_dispositions.is_empty() {
+        *state.weapon_dispositions.lock().map_err(|e| e.to_string())? = result.weapon_dispositions;
+    }
     if !result.wiki_reward_names.is_empty() {
         *state.wiki_reward_names.lock().map_err(|e| e.to_string())? = result.wiki_reward_names;
     }
@@ -647,7 +674,18 @@ struct SavedInventory {
     consumed_suits: Vec<String>,
 }
 
-/// Load the API-sourced inventory data and consumed suits saved from a previous session.
+/// Returns all owned riven mods (veiled and revealed) from the persisted inventory cache.
+/// Runs in a blocking thread so the large inventory JSON deserialization doesn't stall the UI.
+#[tauri::command]
+async fn get_rivens(state: tauri::State<'_, AppState>) -> Result<Vec<memory_scanner::BlobRivenEntry>, String> {
+    let path = state.inventory_state_cache_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        load_inventory_state_cache(&path).rivens
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// Called once on startup so the frontend can restore state without waiting for Warframe to run.
 #[tauri::command]
 fn get_saved_inventory(state: tauri::State<'_, AppState>) -> SavedInventory {
@@ -714,26 +752,56 @@ async fn warframe_login(email: String, password: String) -> Result<(String, Stri
     let hash = format!("{:x}", Whirlpool::digest(password.as_bytes()));
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    let body = format!(
-        "email={}&password={}&time={}&type=pc&appVersion=live",
+
+    // Try multiple endpoint + body format variants.
+    // mobile=true prevents clobbering an active game session.
+    // date=9999999999999999 is required by some versions of the API (device-ID placeholder).
+    let form_body = format!(
+        "email={}&password={}&time={}&mobile=true&appVersion=live&date=9999999999999999",
         urlencoding(&email), hash, now
     );
-    let resp = ureq::post("https://api.warframe.com/API/PHP/login.php")
-        .set("X-Titanium-Id", "9bbd1ddd-f7f2-402d-9777-873f458cb50c")
-        .set("X-Requested-With", "XMLHttpRequest")
-        .set("Content-Type", "application/x-www-form-urlencoded")
-        .set("User-Agent", "Dalvik/2.1.0 (Linux; U; Android 8.1.0)")
-        .send_string(&body)
-        .map_err(|e| format!("Login failed: {}", e))?;
-    let text = resp.into_string().map_err(|e| e.to_string())?;
-    let json: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|_| format!("Login response invalid: {}", &text[..text.len().min(200)]))?;
-    let id = json["id"].as_str().unwrap_or("").to_string();
-    let nonce = json["Nonce"].to_string().trim_matches('"').to_string();
-    if id.is_empty() || nonce == "null" {
-        return Err(format!("Login rejected: {}", &text[..text.len().min(200)]));
+    let json_body = format!(
+        r#"{{"email":"{}","password":"{}","time":{},"date":9999999999999999,"mobile":true,"appVersion":"live"}}"#,
+        email.replace('"', "\\\""), hash, now
+    );
+
+    let candidates: &[(&str, &str, &str)] = &[
+        ("https://api.warframe.com/api/login.php",     "application/json",                  &json_body),
+        ("https://mobile.warframe.com/api/login.php",  "application/json",                  &json_body),
+        ("https://api.warframe.com/api/login.php",     "application/x-www-form-urlencoded", &form_body),
+        ("https://mobile.warframe.com/api/login.php",  "application/x-www-form-urlencoded", &form_body),
+    ];
+
+    let mut errors: Vec<String> = Vec::new();
+    for (url, ct, body) in candidates {
+        let result = ureq::post(url)
+            .set("X-Titanium-Id", "9bbd1ddd-f7f2-402d-9777-873f458cb50c")
+            .set("X-Requested-With", "XMLHttpRequest")
+            .set("Content-Type", ct)
+            .set("User-Agent", "Dalvik/2.1.0 (Linux; U; Android 8.1.0)")
+            .send_string(body);
+        match result {
+            Ok(resp) => {
+                let text = resp.into_string().unwrap_or_default();
+                let json: serde_json::Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => { errors.push(format!("{}: non-JSON: {}", url, &text[..text.len().min(200)])); continue; }
+                };
+                let id    = json["id"].as_str().unwrap_or("").to_string();
+                let nonce = json["Nonce"].to_string().trim_matches('"').to_string();
+                if !id.is_empty() && nonce != "null" {
+                    return Ok((id, nonce));
+                }
+                errors.push(format!("{}: rejected: {}", url, &text[..text.len().min(300)]));
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let body = resp.into_string().unwrap_or_default();
+                errors.push(format!("{}: HTTP {}: {}", url, code, &body[..body.len().min(200)]));
+            }
+            Err(e) => { errors.push(format!("{}: {}", url, e)); }
+        }
     }
-    Ok((id, nonce))
+    Err(format!("All login endpoints failed:\n{}", errors.join("\n")))
 }
 
 fn urlencoding(s: &str) -> String {
@@ -746,7 +814,10 @@ fn urlencoding(s: &str) -> String {
 
 /// Fetch the player's full inventory from the Warframe companion API.
 #[tauri::command]
-async fn fetch_warframe_inventory(account_id: String, nonce: String, steam_id: String) -> Result<serde_json::Value, String> {
+async fn fetch_warframe_inventory(account_id: String, nonce: String, steam_id: String, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let log_enabled = state.api_log_enabled.load(Ordering::SeqCst);
+    let log_dir     = state.api_log_dir.clone();
+
     // Base URL uses lowercase /api/ (not /API/PHP/). ct=STM for Steam platform.
     let endpoints = [
         "https://api.warframe.com/api/inventory.php",
@@ -772,6 +843,12 @@ async fn fetch_warframe_inventory(account_id: String, nonce: String, steam_id: S
             Ok(resp) => {
                 let status = resp.status();
                 let text = resp.into_string().unwrap_or_default();
+                if log_enabled {
+                    let endpoint_name = url.split('/').last().unwrap_or("response");
+                    let ts   = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
+                    let path = log_dir.join(format!("{}_{}.json", ts, endpoint_name));
+                    let _ = std::fs::write(&path, &text);
+                }
                 if status == 200 {
                     return serde_json::from_str(&text)
                         .map_err(|e| format!("Parse failed: {} — body: {}", e, &text[..text.len().min(200)]));
@@ -793,6 +870,13 @@ pub struct WfmItem {
     pub url_name: String,
 }
 
+#[derive(serde::Deserialize)]
+struct WfmRivenAttribute {
+    url_name: String,
+    positive: bool,
+    value:    f64,
+}
+
 // ─── Warframe.market rate limiter ─────────────────────────────────────────────
 // WFM allows ≤3 requests per second. Every WFM HTTP call must call wfm_wait()
 // first. Uses a sliding-window algorithm: tracks timestamps of the last 3
@@ -805,24 +889,22 @@ struct WfmRateLimiter {
 impl WfmRateLimiter {
     fn new() -> Self { Self { times: std::collections::VecDeque::new() } }
 
-    fn acquire(&mut self) {
+    /// Returns None if a slot is available (and records the timestamp),
+    /// or Some(duration) if the caller should sleep before retrying.
+    /// Mutex is released BEFORE the caller sleeps — no blocking while holding the lock.
+    fn try_acquire(&mut self) -> Option<std::time::Duration> {
         const LIMIT: usize = 3;
         const WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
-        loop {
-            let now = std::time::Instant::now();
-            // Evict timestamps outside the 1-second window
-            while let Some(&front) = self.times.front() {
-                if now.duration_since(front) >= WINDOW { self.times.pop_front(); } else { break; }
-            }
-            if self.times.len() < LIMIT {
-                self.times.push_back(now);
-                return;
-            }
-            // All 3 slots used — sleep until the oldest slot expires (+10ms buffer)
+        let now = std::time::Instant::now();
+        while let Some(&front) = self.times.front() {
+            if now.duration_since(front) >= WINDOW { self.times.pop_front(); } else { break; }
+        }
+        if self.times.len() < LIMIT {
+            self.times.push_back(now);
+            None
+        } else {
             let oldest = *self.times.front().unwrap();
-            let wait = WINDOW.saturating_sub(now.duration_since(oldest))
-                + std::time::Duration::from_millis(10);
-            std::thread::sleep(wait);
+            Some(WINDOW.saturating_sub(now.duration_since(oldest)) + std::time::Duration::from_millis(10))
         }
     }
 }
@@ -831,12 +913,16 @@ static WFM_LIMITER: std::sync::OnceLock<std::sync::Mutex<WfmRateLimiter>> =
     std::sync::OnceLock::new();
 
 /// Call this before every warframe.market HTTP request.
+/// Sleeps without holding the mutex so other callers are not blocked during the wait.
 fn wfm_wait() {
-    WFM_LIMITER
-        .get_or_init(|| std::sync::Mutex::new(WfmRateLimiter::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .acquire();
+    let limiter = WFM_LIMITER.get_or_init(|| std::sync::Mutex::new(WfmRateLimiter::new()));
+    loop {
+        let sleep_dur = limiter.lock().unwrap_or_else(|e| e.into_inner()).try_acquire();
+        match sleep_dur {
+            None => break,
+            Some(d) => std::thread::sleep(d),
+        }
+    }
 }
 
 // ─── Warframe.market trading ──────────────────────────────────────────────────
@@ -855,7 +941,90 @@ fn wfm_request(method: &str, path: &str, auth_header: &str) -> ureq::Request {
        .set("Accept", "application/json")
        .set("language", "en")
        .set("platform", "pc")
-       .set("User-Agent", "FrameForge/1.2.0")
+       .set("User-Agent", "FrameForge/2.1.0")
+}
+
+/// Like wfm_request but authenticates via Cookie (JWT=...) instead of Authorization header.
+
+/// Decode the payload of a JWT (base64url, middle part) and extract a field by name.
+fn jwt_payload_field(jwt: &str, field: &str) -> Option<String> {
+    let parts: Vec<&str> = jwt.splitn(3, '.').collect();
+    if parts.len() < 2 { return None; }
+    // base64url without padding
+    let payload_b64 = parts[1];
+    let padded = match payload_b64.len() % 4 {
+        2 => format!("{}==", payload_b64),
+        3 => format!("{}=", payload_b64),
+        _ => payload_b64.to_string(),
+    };
+    let decoded = base64_decode_url(&padded)?;
+    let json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    json[field].as_str().map(|s| s.to_string())
+}
+
+fn base64_decode_url(s: &str) -> Option<Vec<u8>> {
+    // manual base64url → standard base64 → decode
+    let s = s.replace('-', "+").replace('_', "/");
+    // Simple base64 decode without external crates
+    let chars: Vec<u8> = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".to_vec();
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        let c0 = chars.iter().position(|&c| c == bytes[i])? as u32;
+        let c1 = chars.iter().position(|&c| c == bytes[i+1])? as u32;
+        let c2 = chars.iter().position(|&c| c == bytes[i+2]).unwrap_or(64) as u32;
+        let c3 = chars.iter().position(|&c| c == bytes[i+3]).unwrap_or(64) as u32;
+        out.push(((c0 << 2) | (c1 >> 4)) as u8);
+        if c2 != 64 { out.push(((c1 << 4) | (c2 >> 2)) as u8); }
+        if c3 != 64 { out.push(((c2 << 6) | c3) as u8); }
+        i += 4;
+    }
+    Some(out)
+}
+
+/// Fetch the CSRF token from warframe.market by loading the authenticated page.
+/// The meta tag `<meta name="csrf-token" content="...">` in the response HTML contains it.
+/// Falls back to the csrf_token embedded in the JWT payload if the page fetch fails.
+fn fetch_csrf_from_site(jwt: &str) -> Option<String> {
+    if jwt.is_empty() { return None; }
+    let resp = ureq::get("https://warframe.market/")
+        .set("Cookie", &format!("JWT={}", jwt))
+        .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        .call();
+    let html = match resp {
+        Ok(r) => { eprintln!("[csrf] site fetch status=200"); r.into_string().ok()? }
+        Err(e) => {
+            eprintln!("[csrf] site fetch error: {} — trying JWT payload fallback", e);
+            if let Some(t) = jwt_payload_field(jwt, "csrf_token") {
+                eprintln!("[csrf] JWT payload csrf_token len={}", t.len());
+                return Some(t);
+            }
+            return None;
+        }
+    };
+    // Try meta tag
+    let needle = r#"name="csrf-token" content=""#;
+    if let Some(start) = html.find(needle) {
+        let start = start + needle.len();
+        if let Some(end_rel) = html[start..].find('"') {
+            let token = html[start..start + end_rel].to_string();
+            if !token.is_empty() {
+                eprintln!("[csrf] found meta token len={}", token.len());
+                return Some(token);
+            }
+        }
+    }
+    eprintln!("[csrf] meta tag not found in HTML (len={}) — trying JWT payload fallback", html.len());
+    // Log a snippet to see what we got (first 200 chars)
+    eprintln!("[csrf] HTML snippet: {}", &html[..html.len().min(200)]);
+    if let Some(t) = jwt_payload_field(jwt, "csrf_token") {
+        eprintln!("[csrf] JWT payload csrf_token len={}", t.len());
+        Some(t)
+    } else {
+        None
+    }
 }
 
 /// Open warframe.market signin in an embedded WebView.
@@ -868,17 +1037,24 @@ fn wfm_open_login_window(app: tauri::AppHandle) -> Result<(), String> {
     let script = r#"
 (function() {
   var _clientId = '', _deviceId = '';
-  function sendTokens(d) {
+  function sendTokens(d, v1Jwt) {
     if (!d || !d.accessToken || window.__wfmDone) return;
     window.__wfmDone = true;
-    if (window.__TAURI__) {
-      window.__TAURI__.core.invoke('wfm_receive_tokens', {
-        accessToken:  d.accessToken,
-        refreshToken: d.refreshToken || '',
-        clientId:     _clientId,
-        deviceId:     _deviceId,
-      }).catch(function() {});
-    }
+    // Delay slightly so the SPA can update the CSRF meta tag after login redirect.
+    setTimeout(function() {
+      var csrfMeta = document.querySelector('meta[name="csrf-token"]');
+      var csrf = csrfMeta ? csrfMeta.getAttribute('content') : '';
+      if (window.__TAURI__) {
+        window.__TAURI__.core.invoke('wfm_receive_tokens', {
+          accessToken:  d.accessToken,
+          refreshToken: d.refreshToken || '',
+          clientId:     _clientId,
+          deviceId:     _deviceId,
+          v1Jwt:        v1Jwt || null,
+          csrfToken:    csrf || null,
+        }).catch(function() {});
+      }
+    }, 500);
   }
   var origFetch = window.fetch;
   window.fetch = function(input, init) {
@@ -888,10 +1064,13 @@ fn wfm_open_login_window(app: tauri::AppHandle) -> Result<(), String> {
       try { var b = JSON.parse(init.body); _clientId = b.clientId||''; _deviceId = b.deviceId||''; } catch(e) {}
     }
     var p = origFetch.apply(this, arguments);
-    // Capture tokens from auth response
+    // Capture tokens from auth response; also grab Authorization header for v1 endpoints
     if (url.includes('/auth/signin') || url.includes('/auth/refresh')) {
       p.then(function(r) {
-        r.clone().json().then(function(j) { if (j && j.data) sendTokens(j.data); }).catch(function(){});
+        var v1Jwt = r.headers.get('Authorization') || '';
+        // Strip "JWT " prefix if present so we store just the raw token
+        if (v1Jwt.startsWith('JWT ')) v1Jwt = v1Jwt.slice(4);
+        r.clone().json().then(function(j) { if (j && j.data) sendTokens(j.data, v1Jwt || null); }).catch(function(){});
       }).catch(function(){});
     }
     return p;
@@ -934,7 +1113,7 @@ fn wfm_open_login_window(app: tauri::AppHandle) -> Result<(), String> {
 /// Kept so older injected scripts that only captured the JWT still work.
 #[tauri::command]
 fn wfm_receive_jwt(app: tauri::AppHandle, state: State<AppState>, jwt: String) -> Result<(), String> {
-    wfm_receive_tokens(app, state, jwt, String::new(), String::new(), String::new())
+    wfm_receive_tokens(app, state, jwt, String::new(), String::new(), String::new(), None, None)
 }
 
 /// Receive tokens captured by the WebView injection script.
@@ -944,18 +1123,32 @@ fn wfm_receive_tokens(
     app: tauri::AppHandle, state: State<AppState>,
     access_token: String, refresh_token: String,
     client_id: String, device_id: String,
+    #[allow(non_snake_case)] v1Jwt: Option<String>,
+    #[allow(non_snake_case)] csrfToken: Option<String>,
 ) -> Result<(), String> {
     wfm_wait();
     let json: serde_json::Value = ureq::get("https://api.warframe.market/v2/me")
         .set("Authorization", &format!("Bearer {}", access_token))
         .set("language", "en").set("platform", "pc")
-        .set("User-Agent", "FrameForge/1.2.0")
+        .set("User-Agent", "FrameForge/2.1.0")
         .call().map_err(|e| format!("Profile: {}", e))?
         .into_json().map_err(|e| format!("Parse: {}", e))?;
     let username = json["data"]["ingameName"].as_str().unwrap_or("Tenno").to_string();
     let status   = json["data"]["status"].as_str().unwrap_or("offline").to_string();
+    let v1_jwt_val = v1Jwt.unwrap_or_default();
+    // Fetch the CSRF token from the WFM page. The injected script captures it from the meta tag
+    // as a best-effort fallback; if that fails (SPA timing), we fetch the page directly.
+    let csrf = csrfToken.unwrap_or_default();
+    let csrf = if !csrf.is_empty() {
+        csrf
+    } else {
+        fetch_csrf_from_site(&v1_jwt_val).unwrap_or_default()
+    };
+    eprintln!("[csrf] captured csrf_token len={}", csrf.len());
     *state.wfm_session.lock().unwrap_or_else(|e| e.into_inner()) = Some(WfmSession {
         access_token, refresh_token, client_id, device_id, username: username.clone(), status,
+        v1_jwt: v1_jwt_val,
+        csrf_token: csrf,
     });
     if let Some(win) = app.get_webview_window("wfm-login") { let _ = win.close(); }
     let _ = app.emit("wfm-auth-complete", &username);
@@ -980,7 +1173,7 @@ fn wfm_refresh_token(state: State<AppState>) -> Result<(), String> {
     wfm_wait();
     let json: serde_json::Value = ureq::post("https://api.warframe.market/auth/refresh")
         .set("Content-Type", "application/json")
-        .set("User-Agent", "FrameForge/1.2.0")
+        .set("User-Agent", "FrameForge/2.1.0")
         .send_string(&body.to_string())
         .map_err(|e| format!("Refresh: {}", e))?
         .into_json().map_err(|e| format!("Parse: {}", e))?;
@@ -1002,18 +1195,26 @@ fn wfm_set_jwt(state: State<AppState>, jwt: String) -> Result<(String, String), 
     let refresh_token = data["refreshToken"].as_str().unwrap_or("").to_string();
     let client_id     = data["clientId"].as_str().unwrap_or("").to_string();
     let device_id     = data["deviceId"].as_str().unwrap_or("").to_string();
+    let v1_jwt        = data["v1Jwt"].as_str().unwrap_or("").to_string();
+    let mut csrf_token = data["csrfToken"].as_str().unwrap_or("").to_string();
     // Validate by calling /v2/me
     wfm_wait();
     let json: serde_json::Value = ureq::get("https://api.warframe.market/v2/me")
         .set("Authorization", &format!("Bearer {}", access_token))
         .set("language", "en").set("platform", "pc")
-        .set("User-Agent", "FrameForge/1.2.0")
+        .set("User-Agent", "FrameForge/2.1.0")
         .call().map_err(|e| format!("401: {}", e))?
         .into_json().map_err(|e| format!("Parse: {}", e))?;
     let username = json["data"]["ingameName"].as_str().unwrap_or("Tenno").to_string();
     let status   = json["data"]["status"].as_str().unwrap_or("offline").to_string();
+    // If no saved CSRF token, fetch it from the site now
+    if csrf_token.is_empty() && !v1_jwt.is_empty() {
+        eprintln!("[csrf] set_jwt: no saved token, fetching from site...");
+        csrf_token = fetch_csrf_from_site(&v1_jwt).unwrap_or_default();
+        eprintln!("[csrf] set_jwt: csrf_token len={}", csrf_token.len());
+    }
     *state.wfm_session.lock().unwrap_or_else(|e| e.into_inner()) = Some(WfmSession {
-        access_token, refresh_token, client_id, device_id, username: username.clone(), status: status.clone(),
+        access_token, refresh_token, client_id, device_id, username: username.clone(), status: status.clone(), v1_jwt, csrf_token,
     });
     Ok((username, status))
 }
@@ -1028,7 +1229,7 @@ fn wfm_login(state: State<AppState>, email: String, password: String) -> Result<
     let resp = ureq::post("https://api.warframe.market/v1/auth/signin")
         .set("Content-Type", "application/json")
         .set("Authorization", "JWT")
-        .set("User-Agent", "FrameForge/1.2.0")
+        .set("User-Agent", "FrameForge/2.1.0")
         .send_string(&body.to_string())
         .map_err(|e| format!("Login failed: {}", e))?;
 
@@ -1047,8 +1248,10 @@ fn wfm_login(state: State<AppState>, email: String, password: String) -> Result<
         .as_str().unwrap_or("offline").to_string();
 
     *state.wfm_session.lock().unwrap_or_else(|e| e.into_inner()) = Some(WfmSession {
+        v1_jwt: token.clone(), // v1 login: JWT is the auth token for v1 endpoints
+        csrf_token: String::new(),
         access_token: token,
-        refresh_token: String::new(), // v1 has no refresh token
+        refresh_token: String::new(),
         client_id: String::new(),
         device_id: String::new(),
         username: username.clone(),
@@ -1064,7 +1267,7 @@ fn wfm_get_item_orders(state: State<AppState>, url_name: String) -> Result<serde
         .as_ref().map(|s| s.auth_header());
     wfm_wait();
     let mut req = ureq::get(&format!("https://api.warframe.market/v2/orders/item/{}", url_name))
-        .set("language", "en").set("platform", "pc").set("User-Agent", "FrameForge/1.2.0");
+        .set("language", "en").set("platform", "pc").set("User-Agent", "FrameForge/2.1.0");
     if let Some(ref h) = auth { req = req.set("Authorization", h); }
     let json: serde_json::Value = req.call().map_err(|e| format!("orders: {}", e))?
         .into_json().map_err(|e| format!("parse: {}", e))?;
@@ -1096,7 +1299,7 @@ fn wfm_get_item_statistics(state: State<AppState>, url_name: String) -> Result<s
         .as_ref().map(|s| s.auth_header());
     wfm_wait();
     let mut req = ureq::get(&format!("https://api.warframe.market/v1/items/{}/statistics", url_name))
-        .set("language", "en").set("platform", "pc").set("User-Agent", "FrameForge/1.2.0");
+        .set("language", "en").set("platform", "pc").set("User-Agent", "FrameForge/2.1.0");
     if let Some(ref h) = auth { req = req.set("Authorization", h); }
     let json: serde_json::Value = req.call().map_err(|e| format!("stats: {}", e))?
         .into_json().map_err(|e| format!("parse: {}", e))?;
@@ -1126,7 +1329,7 @@ struct WfmTopDiskCache {
 fn fetch_wfm_prime_sets() -> Vec<(String, String)> {
     wfm_wait();
     let resp = ureq::get("https://api.warframe.market/v2/items")
-        .set("User-Agent", "FrameForge/1.2.0")
+        .set("User-Agent", "FrameForge/2.1.0")
         .timeout(std::time::Duration::from_secs(15))
         .call();
     let json: serde_json::Value = match resp {
@@ -1412,7 +1615,7 @@ fn wfm_fetch_status(state: State<AppState>) -> Result<String, String> {
     let json: serde_json::Value = ureq::get("https://api.warframe.market/v2/me")
         .set("Authorization", &format!("Bearer {}", token))
         .set("language", "en").set("platform", "pc")
-        .set("User-Agent", "FrameForge/1.2.0")
+        .set("User-Agent", "FrameForge/2.1.0")
         .call().map_err(|e| format!("Status fetch: {}", e))?
         .into_json().map_err(|e| format!("Parse: {}", e))?;
     Ok(json["data"]["status"].as_str().unwrap_or("offline").to_string())
@@ -1427,12 +1630,19 @@ fn wfm_get_jwt(state: State<AppState>) -> Option<String> {
             "refreshToken": s.refresh_token,
             "clientId":     s.client_id,
             "deviceId":     s.device_id,
+            "v1Jwt":        s.v1_jwt,
+            "csrfToken":    s.csrf_token,
         }).to_string())
 }
 
 fn session_auth(state: &State<AppState>) -> Result<String, String> {
     state.wfm_session.lock().unwrap_or_else(|e| e.into_inner())
         .as_ref().map(|s| s.auth_header()).ok_or("Not logged in to warframe.market".into())
+}
+
+fn session_v1_auth(state: &State<AppState>) -> Result<String, String> {
+    state.wfm_session.lock().unwrap_or_else(|e| e.into_inner())
+        .as_ref().map(|s| s.v1_auth_header()).ok_or("Not logged in to warframe.market".into())
 }
 
 /// Fetch the authenticated user's active buy + sell orders.
@@ -1691,6 +1901,13 @@ pub struct RivenAnalysis {
 static RIVEN_DB: std::sync::OnceLock<std::sync::Mutex<HashMap<String, RivenEntry>>> =
     std::sync::OnceLock::new();
 
+/// Returns a map of weapon unique_name → riven disposition (omegaAttenuation).
+/// Data comes from All.json (fetched during item load) — no extra HTTP request.
+#[tauri::command]
+fn get_weapon_dispositions(state: State<AppState>) -> HashMap<String, f32> {
+    state.weapon_dispositions.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Cache for top WFM items: (fetched_at, items). Refreshed when older than 3 hours.
 static WFM_TOP_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(std::time::Instant, Vec<WfmTopItem>)>>> =
     std::sync::OnceLock::new();
@@ -1733,7 +1950,7 @@ fn load_riven_csv_from_url() -> Result<HashMap<String, RivenEntry>, String> {
             RIVEN_SHEET_ID, gid
         );
         match ureq::get(&url)
-            .set("User-Agent", "FrameForge/1.4.2")
+            .set("User-Agent", "FrameForge/2.1.0")
             .call().map_err(|e| e.to_string())
             .and_then(|r| r.into_string().map_err(|e| e.to_string()))
         {
@@ -2748,6 +2965,35 @@ fn wfm_debug_dump(state: State<AppState>, path: String) -> Result<String, String
     serde_json::to_string_pretty(&json).map_err(|e| e.to_string())
 }
 
+/// Collect known riven attribute url_names by sampling real auction listings.
+/// /v1/riven/attributes was removed; this scrapes url_names from search results instead.
+/// Exposed so the browser console can call: window.__wfmAttrs()
+#[tauri::command]
+fn wfm_get_riven_attributes() -> Result<Vec<String>, String> {
+    wfm_wait();
+    let json: serde_json::Value = ureq::get("https://api.warframe.market/v1/auctions/search")
+        .query("type", "riven")
+        .set("language", "en").set("platform", "pc")
+        .set("User-Agent", "FrameForge/2.1.0")
+        .call().map_err(|e| format!("Search: {}", e))?
+        .into_json().map_err(|e| format!("Parse: {}", e))?;
+    let mut seen = std::collections::HashSet::new();
+    if let Some(auctions) = json["payload"]["auctions"].as_array() {
+        for auction in auctions {
+            if let Some(attrs) = auction["item"]["attributes"].as_array() {
+                for attr in attrs {
+                    if let Some(url) = attr["url_name"].as_str() {
+                        seen.insert(url.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let mut list: Vec<String> = seen.into_iter().collect();
+    list.sort();
+    Ok(list)
+}
+
 /// Get the internal WFM item ID for a URL slug (needed to create orders).
 #[tauri::command]
 fn wfm_get_item_info(state: State<AppState>, url_name: String) -> Result<serde_json::Value, String> {
@@ -2791,6 +3037,169 @@ fn wfm_delete_order(state: State<AppState>, order_id: String) -> Result<(), Stri
     wfm_wait();
     wfm_request("DELETE", &format!("/v2/order/{}", order_id), &auth)
         .call().map_err(|e| format!("Delete order: {}", e))?;
+    Ok(())
+}
+
+/// Post a revealed riven as an auction on warframe.market.
+#[tauri::command]
+fn wfm_create_riven_auction(
+    state: State<AppState>,
+    weapon_url_name: String,
+    riven_name: String,
+    mastery_level: u32,
+    mod_rank: u8,
+    re_rolls: u32,
+    polarity: String,
+    attributes: Vec<WfmRivenAttribute>,
+    starting_price: u32,
+    buyout_price: Option<u32>,
+    minimal_reputation: u32,
+    note: String,
+    visible: bool,
+) -> Result<serde_json::Value, String> {
+    let auth = session_v1_auth(&state)?;
+    let attrs: Vec<serde_json::Value> = attributes.iter().map(|a| serde_json::json!({
+        "url_name": a.url_name,
+        "positive": a.positive,
+        "value":    a.value,
+    })).collect();
+    let mut payload = serde_json::json!({
+        "item": {
+            "type": "riven",
+            "weapon_url_name": weapon_url_name,
+            "name": riven_name,
+            "mastery_level": mastery_level,
+            "mod_rank": mod_rank,
+            "re_rolls": re_rolls,
+            "polarity": polarity,
+            "attributes": attrs,
+        },
+        "starting_price": starting_price,
+        "minimal_reputation": minimal_reputation,
+        "note": note,
+        "visible": visible,
+    });
+    // WFM v1 requires buyout_price to be present in the payload (null = no buyout).
+    payload["buyout_price"] = serde_json::json!(buyout_price);
+    wfm_wait();
+    let resp = wfm_request("POST", "/v1/auctions/create", &auth)
+        .send_json(payload)
+        .map_err(|e| match e {
+            ureq::Error::Status(code, r) => {
+                let body = r.into_string().unwrap_or_default();
+                format!("Create riven auction: HTTP {}: {}", code, body)
+            }
+            other => format!("Create riven auction: {}", other),
+        })?;
+    let json: serde_json::Value = resp.into_json()
+        .map_err(|e| format!("Parse auction response: {}", e))?;
+    if let Some(id) = json["payload"]["auction"]["id"].as_str() {
+        let mut ids = state.auction_ids.lock().unwrap_or_else(|e| e.into_inner());
+        if !ids.contains(&id.to_string()) {
+            ids.push(id.to_string());
+            drop(ids);
+            save_auction_ids(&state);
+        }
+    }
+    Ok(json)
+}
+
+/// Fetch the current user's active riven auctions from warframe.market.
+/// Tries v2 /auctions/my first (returns all including hidden); falls back to the v1 profile
+/// endpoint which only returns visible auctions.
+#[tauri::command]
+async fn wfm_get_my_riven_auctions(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let (v1_auth, username, stored_ids) = {
+        let lock = state.wfm_session.lock().unwrap_or_else(|e| e.into_inner());
+        let s = lock.as_ref().ok_or("Not logged in to warframe.market")?;
+        let ids = state.auction_ids.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        (s.v1_auth_header(), s.username.clone(), ids)
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        // Phase 1: profile endpoint with Bearer auth — returns visible auctions.
+        wfm_wait();
+        let profile_resp: serde_json::Value = wfm_request(
+            "GET", &format!("/v1/profile/{}/auctions", username), &v1_auth,
+        )
+        .call()
+        .map_err(|e| format!("Fetch auctions: {}", e))?
+        .into_json()
+        .map_err(|e| format!("Parse auctions: {}", e))?;
+
+        let mut auctions: Vec<serde_json::Value> = profile_resp["payload"]["auctions"]
+            .as_array().cloned().unwrap_or_default();
+
+        // Collect IDs already returned so we don't double-fetch.
+        let seen_ids: std::collections::HashSet<String> = auctions.iter()
+            .filter_map(|a| a["id"].as_str().map(|s| s.to_string()))
+            .collect();
+
+        // Phase 2: fetch each stored ID that wasn't in the public list (i.e. hidden auctions).
+        for id in &stored_ids {
+            if seen_ids.contains(id) { continue; }
+            wfm_wait();
+            let entry: serde_json::Value = match wfm_request(
+                "GET", &format!("/v1/auctions/entry/{}", id), &v1_auth,
+            ).call() {
+                Ok(r) => match r.into_json() {
+                    Ok(j) => j,
+                    Err(_) => continue,
+                },
+                Err(_) => continue,
+            };
+            if let Some(auction) = entry["payload"]["auction"].as_object() {
+                // Skip closed auctions — they've been traded and shouldn't clutter the list.
+                if auction.get("closed").and_then(|v| v.as_bool()).unwrap_or(false) { continue; }
+                auctions.push(serde_json::Value::Object(auction.clone()));
+            }
+        }
+
+        Ok(serde_json::json!({ "payload": { "auctions": auctions } }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn save_auction_ids(state: &State<AppState>) {
+    let ids = state.auction_ids.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Ok(json) = serde_json::to_string(&ids) {
+        let _ = atomic_write(&state.auction_ids_path, json.as_bytes());
+    }
+}
+
+/// Delete a riven auction via the /close endpoint.
+#[tauri::command]
+fn wfm_delete_auction(state: State<AppState>, auction_id: String) -> Result<(), String> {
+    let auth = session_v1_auth(&state)?;
+    wfm_wait();
+    wfm_request("PUT", &format!("/v1/auctions/entry/{}/close", auction_id), &auth)
+        .call()
+        .map_err(|e| match e {
+            ureq::Error::Status(code, r) => {
+                let body = r.into_string().unwrap_or_default();
+                format!("Delete auction: HTTP {}: {}", code, body)
+            }
+            other => format!("Delete auction: {}", other),
+        })?;
+    state.auction_ids.lock().unwrap_or_else(|e| e.into_inner()).retain(|id| id != &auction_id);
+    save_auction_ids(&state);
+    Ok(())
+}
+
+/// Toggle visibility of a riven auction (visible / hidden).
+#[tauri::command]
+fn wfm_set_auction_visible(state: State<AppState>, auction_id: String, visible: bool) -> Result<(), String> {
+    let auth = session_v1_auth(&state)?;
+    wfm_wait();
+    wfm_request("PUT", &format!("/v1/auctions/entry/{}", auction_id), &auth)
+        .send_json(serde_json::json!({ "visible": visible }))
+        .map_err(|e| match e {
+            ureq::Error::Status(code, r) => {
+                let body = r.into_string().unwrap_or_default();
+                format!("Set auction visibility: HTTP {}: {}", code, body)
+            }
+            other => format!("Set auction visibility: {}", other),
+        })?;
     Ok(())
 }
 
@@ -3293,6 +3702,12 @@ fn set_blob_log(enabled: bool, state: State<'_, AppState>) {
     state.blob_log_enabled.store(enabled, Ordering::SeqCst);
 }
 
+/// Enable or disable logging of raw DE API responses to api_logs/.
+#[tauri::command]
+fn set_api_log(enabled: bool, state: State<'_, AppState>) {
+    state.api_log_enabled.store(enabled, Ordering::SeqCst);
+}
+
 /// Returns "started" or "stopped" so the frontend can update button state.
 #[tauri::command]
 async fn toggle_raw_scan(state: State<'_, AppState>) -> Result<String, String> {
@@ -3407,6 +3822,7 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
     if state.monitor_active.swap(true, Ordering::SeqCst) {
         return Ok(()); // already running
     }
+
     // Capture the Tokio runtime handle while we're in the async context.
     // The monitoring thread (std::thread::spawn) has no COM/WinRT, so all OCR
     // calls are routed through spawn_blocking which runs on Tokio's thread pool
@@ -3507,9 +3923,13 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
 
         // Pre-populate known with cached resource quantities so that per-cycle hint
         // emits never replace the frontend display with a partial inventory.
-        // Only non-unique, non-mod paths (resources, relics, blueprints, etc.).
+        // is_stackable overrides is_unique_path: Kubrow Eggs, Kavat Genetic Codes,
+        // cosmetics, and Railjack weapons share path prefixes with actual unique items
+        // but have counts > 1 from MiscItems/FlavourItems — they must go into known.
         for (path, item) in &startup_cache.items {
-            if item.amount > 0 && item.mod_ranks.is_none() && !is_unique_path(path) {
+            if item.amount > 0 && item.mod_ranks.is_none()
+                && (item.is_stackable || !is_unique_path(path))
+            {
                 known.entry(path.clone()).or_insert(item.amount as i64);
             }
         }
@@ -3521,8 +3941,10 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
 
         // Stability buffer for unique scanner items (weapons/warframes).
         // Pre-seed confirmed items at count=4 so they show immediately on restart.
+        // Exclude is_stackable items — they are seeded into known above, not here.
         let mut unique_stable: HashMap<String, u8> = startup_cache.items.iter()
-            .filter(|(k, v)| v.mod_ranks.is_none() && v.amount > 0 && !v.subsumed && is_unique_path(k))
+            .filter(|(k, v)| v.mod_ranks.is_none() && v.amount > 0 && !v.subsumed
+                          && !v.is_stackable && is_unique_path(k))
             .map(|(k, _)| (k.clone(), 4u8))
             .collect();
         let mut confirmed_unique: std::collections::HashSet<String> =
@@ -3597,6 +4019,13 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
             .map(|(k, v)| (k.clone(), v.archon_shards.clone()))
             .collect();
         let mut last_blob_time: Option<std::time::Instant> = None;
+        // Guard against overlapping captures: a full memory walk can take >10 s on large
+        // game processes, so without this flag we'd stack up concurrent scan threads.
+        let blob_scan_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Cache the game-running state so we only re-enumerate processes once every 5 s
+        // instead of on every 2-second loop tick (CreateToolhelp32Snapshot is not free).
+        let mut last_pid_check: Option<std::time::Instant> = None;
+        let mut cached_game_running = false;
 
         while flag.load(Ordering::SeqCst) {
             // If shared_quantities was cleared externally (clear_cache command), wipe local
@@ -3673,6 +4102,12 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                 known_mods.clear();
                 for (path, mc) in &blob.mods {
                     known_mods.insert(path.clone(), mc.clone());
+                }
+                // Rivens — group by item_type so they appear in inventory like regular mods
+                for riven in &blob.rivens {
+                    let mc = known_mods.entry(riven.item_type.clone()).or_default();
+                    mc.total += riven.count as i64;
+                    *mc.by_rank.entry(riven.mod_rank).or_insert(0) += riven.count as i64;
                 }
 
                 // Cosmetics (FlavourItems + WeaponSkins) — occurrence-counted, go into known
@@ -3781,17 +4216,29 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                 }
             }
 
-            // Periodic blob capture every 30s while game is running
-            let game_running = memory_scanner::find_warframe_pid_pub().is_some();
+            // Periodic blob capture every 10s while game is running.
+            // blob_scan_active prevents overlapping captures — a full memory walk on a
+            // large game process can exceed 10 s, so without the guard we'd stack threads.
+            // Re-enumerate processes at most every 5 s (CreateToolhelp32Snapshot overhead).
+            let needs_pid_check = last_pid_check
+                .map_or(true, |t: std::time::Instant| t.elapsed().as_secs() >= 5);
+            if needs_pid_check {
+                cached_game_running = memory_scanner::find_warframe_pid_pub().is_some();
+                last_pid_check = Some(std::time::Instant::now());
+            }
+            let game_running = cached_game_running;
             if game_running {
                 let should_capture = last_blob_time
-                    .map_or(true, |t: std::time::Instant| t.elapsed() >= std::time::Duration::from_secs(30));
-                if should_capture {
+                    .map_or(true, |t: std::time::Instant| t.elapsed() >= std::time::Duration::from_secs(10));
+                let already_running = blob_scan_active.load(Ordering::SeqCst);
+                if should_capture && !already_running {
+                    blob_scan_active.store(true, Ordering::SeqCst);
                     last_blob_time = Some(std::time::Instant::now());
-                    let ts   = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
-                    let dir  = blob_log_dir.clone();
-                    let tx   = blob_tx.clone();
-                    let save = blob_log_enabled.load(Ordering::SeqCst);
+                    let ts     = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
+                    let dir    = blob_log_dir.clone();
+                    let tx     = blob_tx.clone();
+                    let save   = blob_log_enabled.load(Ordering::SeqCst);
+                    let active = blob_scan_active.clone();
                     let _ = app.emit("blob-status", BlobStatusPayload {
                         stage:  "scanning".into(),
                         detail: "Reading Warframe memory\u{2026}".into(),
@@ -3799,6 +4246,7 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                     eprintln!("[monitor] blob capture starting (save={})", save);
                     std::thread::spawn(move || {
                         let count = memory_scanner::capture_all_blobs(&dir, &ts, tx, save);
+                        active.store(false, Ordering::SeqCst);
                         eprintln!("[monitor] blob capture finished (files_saved={} save_flag={} ts={})", count, save, ts);
                     });
                 }
@@ -4029,6 +4477,9 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
             // Cooldown: after any dismiss, block new triggers for 5 s to filter
             // stale EE.log lines that can arrive shortly after a dismiss.
             let mut last_dismiss_at: Option<std::time::Instant> = None;
+            // One diagnostics folder per trigger→dismiss cycle.
+            // Created at trigger, BMP written after overlay confirmed, session log at dismiss.
+            let diag_arc: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::new(Mutex::new(None));
 
             // Use FindFirstChangeNotificationW so we wake the instant EE.log is
             // written to disk instead of sleeping 200 ms between checks.
@@ -4361,6 +4812,12 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                         elapsed_s.map(|s| format!("{:.1}s", s)).unwrap_or_else(|| "(unknown)".to_string())
                     );
                     append_to_diag(&session_log_path, &dismiss_block);
+                    // Copy the completed session log to the diagnostics folder for this run.
+                    if let Ok(mut g) = diag_arc.lock() {
+                        if let Some(folder) = g.take() {
+                            let _ = std::fs::copy(&session_log_path, folder.join("ocr_session_log.txt"));
+                        }
+                    }
                     reward_screen_active2.store(false, Ordering::SeqCst);
                     active_since = None;
                     last_dismiss_at = Some(std::time::Instant::now());
@@ -4454,6 +4911,12 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                     if let Err(e) = write_err {
                         eprintln!("[FrameForge] session log write failed: {e}");
                     }
+                    // Create one diagnostics folder for this entire run.
+                    let run_diag_dir = diag_dir().join(
+                        chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string()
+                    );
+                    let _ = std::fs::create_dir_all(&run_diag_dir);
+                    if let Ok(mut g) = diag_arc.lock() { *g = Some(run_diag_dir); }
                     let _ = std::fs::write(&ee_last_path, format!(
                         "=== {} ===\nEE.log trigger fired\n{}\n", ts0, trigger_line
                     ));
@@ -4471,6 +4934,7 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                     let active     = reward_screen_active2.clone();
                     let squad_arc  = std::sync::Arc::clone(&shared_squad_size);
                     let names_arc  = std::sync::Arc::clone(&shared_squad_names);
+                    let diag_arc2  = Arc::clone(&diag_arc);
                     // Do NOT write ee_squad_size here. The mutex is already reset to None
                     // when GetVoidProjectionRewards fires (above), and is updated to the
                     // correct squad count when the sequence completes (line ~3395).
@@ -4654,8 +5118,25 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                                             // quality (player-name pollution, brightness change).
                                             let emit_val = if best_payload.is_some() { &best_payload } else { &payload };
                                             let _ = app.emit("relic-rewards", emit_val);
+                                            // After 1.5 s the overlay has finished animating in —
+                                            // capture the full desktop (DXGI) so the BMP shows the overlay.
+                                            {
+                                                let diag_snap = diag_arc2.lock().ok().and_then(|g| g.clone());
+                                                if let Some(folder) = diag_snap {
+                                                    tauri::async_runtime::spawn(async move {
+                                                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                                                        tauri::async_runtime::spawn_blocking(move || {
+                                                            if let Some((px, w, h)) = ocr::capture_desktop_for_diag() {
+                                                                let _ = write_bmp(&folder.join("screenshot.bmp"), &px, w, h);
+                                                            }
+                                                        }).await.ok();
+                                                    });
+                                                }
+                                            }
                                             let app2 = app.clone();
                                             let slog2 = slog.clone();
+                                            let diag_arc_fb = Arc::clone(&diag_arc2);
+                                            let slog_fb = slog.clone();
                                             tauri::async_runtime::spawn(async move {
                                                 // 20s safety fallback — normally the overlay closes
                                                 // when EE.log fires "relic timer closed" (player picks).
@@ -4666,6 +5147,11 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                                                 }
                                                 append_to_diag(&slog2,
                                                     "[STEP 4] AUTO-DISMISS (20s safety fallback)\n\n");
+                                                if let Ok(mut g) = diag_arc_fb.lock() {
+                                                    if let Some(folder) = g.take() {
+                                                        let _ = std::fs::copy(&slog_fb, folder.join("ocr_session_log.txt"));
+                                                    }
+                                                }
                                             });
                                             break;
                                         } else {
@@ -4688,8 +5174,23 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                                         let _ = app.emit("relic-rewards", &emit_val);
                                         let _ = append_to_file(&slog,
                                             "[STEP 3] OVERLAY OPENED (soft-complete confirmed — no improvement)\n\n");
+                                        {
+                                            let diag_snap = diag_arc2.lock().ok().and_then(|g| g.clone());
+                                            if let Some(folder) = diag_snap {
+                                                tauri::async_runtime::spawn(async move {
+                                                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                                                    tauri::async_runtime::spawn_blocking(move || {
+                                                        if let Some((px, w, h)) = ocr::capture_desktop_for_diag() {
+                                                            let _ = write_bmp(&folder.join("screenshot.bmp"), &px, w, h);
+                                                        }
+                                                    }).await.ok();
+                                                });
+                                            }
+                                        }
                                         let app2 = app.clone();
                                         let slog2 = slog.clone();
+                                        let diag_arc_fb = Arc::clone(&diag_arc2);
+                                        let slog_fb = slog.clone();
                                         tauri::async_runtime::spawn(async move {
                                             tokio::time::sleep(std::time::Duration::from_secs(20)).await;
                                             let _ = app2.emit("relic-rewards", serde_json::Value::Null);
@@ -4698,6 +5199,11 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                                             }
                                             let _ = append_to_file(&slog2,
                                                 "[STEP 4] AUTO-DISMISS (20s safety fallback)\n\n");
+                                            if let Ok(mut g) = diag_arc_fb.lock() {
+                                                if let Some(folder) = g.take() {
+                                                    let _ = std::fs::copy(&slog_fb, folder.join("ocr_session_log.txt"));
+                                                }
+                                            }
                                         });
                                         break;
                                     }
@@ -4782,6 +5288,11 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                                     let _ = win.close();
                                 }
                                 active.store(false, Ordering::SeqCst);
+                                if let Ok(mut g) = diag_arc2.lock() {
+                                    if let Some(folder) = g.take() {
+                                        let _ = std::fs::copy(&slog, folder.join("ocr_session_log.txt"));
+                                    }
+                                }
                                 break;
                             }
                             if !active.load(Ordering::SeqCst) {
@@ -4806,6 +5317,11 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                              └─ Open for : {:.1}s\n\n",
                             ts_a, since.elapsed().as_secs_f64()
                         ));
+                        if let Ok(mut g) = diag_arc.lock() {
+                            if let Some(folder) = g.take() {
+                                let _ = std::fs::copy(&session_log_path, folder.join("ocr_session_log.txt"));
+                            }
+                        }
                         reward_screen_active2.store(false, Ordering::SeqCst);
                         active_since = None;
                         last_dismiss_at = Some(std::time::Instant::now());
@@ -5670,7 +6186,7 @@ async fn fetch_worldstate(state: State<'_, AppState>) -> Result<serde_json::Valu
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let raw = ureq::get("https://api.warframe.com/cdn/worldState.php")
-            .set("User-Agent", "FrameForge/1.0")
+            .set("User-Agent", "FrameForge/2.1.0")
             .call()
             .map_err(|e| format!("worldstate fetch failed: {}", e))?
             .into_json::<serde_json::Value>()
@@ -5682,7 +6198,7 @@ async fn fetch_worldstate(state: State<'_, AppState>) -> Result<serde_json::Valu
         let news: Vec<serde_json::Value> = ureq::get(
             "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=230410&count=10&maxlength=500&format=json"
         )
-            .set("User-Agent", "FrameForge/1.0")
+            .set("User-Agent", "FrameForge/2.1.0")
             .timeout(std::time::Duration::from_secs(10))
             .call()
             .ok()
@@ -5762,6 +6278,61 @@ fn clear_diag_folder() -> u64 {
         }
     }
     0
+}
+
+/// Open a debug folder in Windows Explorer.
+/// `which`: "blobs" | "api_logs" | "raw_scan" | "probe" | "diag"
+#[tauri::command]
+fn open_debug_folder(state: State<AppState>, which: String) -> Result<(), String> {
+    let path: std::path::PathBuf = match which.as_str() {
+        "blobs"    => state.blob_log_dir.clone(),
+        "api_logs" => state.api_log_dir.clone(),
+        "raw_scan" | "probe" => state.raw_scan_path.parent()
+            .ok_or("no parent")?.to_path_buf(),
+        "diag"     => diag_dir(),
+        _ => return Err("Unknown debug folder".into()),
+    };
+    std::fs::create_dir_all(&path).ok();
+    std::process::Command::new("explorer")
+        .arg(path.to_string_lossy().as_ref())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Clear debug data for a specific category.
+/// `which`: "blobs" | "api_logs" | "raw_scan" | "probe"
+#[tauri::command]
+fn clear_debug_data(state: State<AppState>, which: String) -> Result<(), String> {
+    let clear_dir = |dir: &std::path::Path| {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.filter_map(|e| e.ok()) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    };
+    match which.as_str() {
+        "blobs"    => clear_dir(&state.blob_log_dir),
+        "api_logs" => clear_dir(&state.api_log_dir),
+        "raw_scan" => { let _ = std::fs::remove_file(&state.raw_scan_path); }
+        "probe"    => { let _ = std::fs::remove_file(state.log_path.with_file_name("memory_probe.txt")); }
+        _ => return Err("Unknown debug data type".into()),
+    }
+    Ok(())
+}
+
+/// Return the byte size of a debug folder or file.
+/// `which`: "blobs" | "api_logs" | "raw_scan" | "probe" | "diag"
+#[tauri::command]
+fn get_debug_data_size(state: State<AppState>, which: String) -> u64 {
+    match which.as_str() {
+        "blobs"    => dir_size_bytes(&state.blob_log_dir),
+        "api_logs" => dir_size_bytes(&state.api_log_dir),
+        "raw_scan" => std::fs::metadata(&state.raw_scan_path).map(|m| m.len()).unwrap_or(0),
+        "probe"    => std::fs::metadata(state.log_path.with_file_name("memory_probe.txt")).map(|m| m.len()).unwrap_or(0),
+        "diag"     => dir_size_bytes(&diag_dir()),
+        _ => 0,
+    }
 }
 
 /// Write BGRA pixels as an uncompressed 24-bit BGR BMP file.
@@ -5956,8 +6527,9 @@ fn load_items_cache(path: &PathBuf) -> Option<Vec<WfcdItem>> {
         let ducats = v["ducats"].as_u64().map(|n| n as u32);
         let raw_cat = v["category"].as_str()?.to_string();
         let category = patch_item_category(&name, &raw_cat);
-        let mastery_req = v["mastery_req"].as_u64().map(|n| n as u32);
-        Some(WfcdItem { unique_name, name, category, image_name, vaulted, ducats, mastery_req })
+        let mastery_req       = v["mastery_req"].as_u64().map(|n| n as u32);
+        let omega_attenuation = v["omega_attenuation"].as_f64().map(|n| n as f32);
+        Some(WfcdItem { unique_name, name, category, image_name, vaulted, ducats, mastery_req, omega_attenuation })
     }).collect();
     if items.is_empty() { None } else { Some(dedup_known_aliases(items)) }
 }
@@ -6039,6 +6611,13 @@ struct CachedItem {
     /// colour palettes, animation sets, etc.).
     #[serde(default, skip_serializing_if = "is_false")]
     is_flavour: bool,
+    /// True when this item came from MiscItems (stackable resources/relics) or
+    /// FlavourItems/WeaponSkins (occurrence-counted cosmetics). Prevents items
+    /// whose Lotus path matches is_unique_path() (e.g. Kubrow Eggs, Kavat Genetic
+    /// Codes, helmets under /Lotus/Powersuits/) from being treated as binary-owned
+    /// on startup, which would cause spurious 1→N change log entries every session.
+    #[serde(default, skip_serializing_if = "is_false")]
+    is_stackable: bool,
 }
 
 fn is_false(v: &bool) -> bool { !v }
@@ -6054,6 +6633,9 @@ struct InventoryStateCache {
     /// Player-level mastery rank (separate from per-item ranks).
     #[serde(default)]
     mastery_rank: Option<u32>,
+    /// All owned riven mods (veiled and revealed), populated from blob scans.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    rivens: Vec<memory_scanner::BlobRivenEntry>,
 }
 
 impl InventoryStateCache {
@@ -6134,11 +6716,29 @@ fn build_inventory_from_blob(
     for entry in &blob.stackable_items {
         if excluded_paths.contains(&entry.item_type) { continue; }
         if entry.item_count <= 0 { continue; }
-        upsert!(&entry.item_type).amount = entry.item_count;
+        let item = upsert!(&entry.item_type);
+        item.amount      = entry.item_count;
+        item.is_stackable = true;
     }
 
     // Mods and arcanes (merged from RawUpgrades + Upgrades).
     for (path, mc) in &blob.mods {
+        if excluded_paths.contains(path) { continue; }
+        let item = upsert!(path);
+        item.amount    = mc.total;
+        item.mod_ranks = Some(mc.by_rank.iter().map(|(&r, &c)| (r.to_string(), c)).collect());
+    }
+
+    // Rivens — group by item_type so they land in `items` with mod_ranks.
+    // This ensures the startup cache seeds known_mods with riven counts, preventing
+    // spurious 0→N change log entries on every app restart.
+    let mut riven_counts: HashMap<String, memory_scanner::ModCount> = HashMap::new();
+    for riven in &blob.rivens {
+        let mc = riven_counts.entry(riven.item_type.clone()).or_default();
+        mc.total += riven.count as i64;
+        *mc.by_rank.entry(riven.mod_rank).or_insert(0) += riven.count as i64;
+    }
+    for (path, mc) in &riven_counts {
         if excluded_paths.contains(path) { continue; }
         let item = upsert!(path);
         item.amount    = mc.total;
@@ -6150,8 +6750,9 @@ fn build_inventory_from_blob(
     for (path, &count) in blob.flavour_items.iter().chain(blob.weapon_skins.iter()) {
         if excluded_paths.contains(path) { continue; }
         let item = upsert!(path);
-        item.amount    = count;
-        item.is_flavour = true;
+        item.amount      = count;
+        item.is_flavour  = true;
+        item.is_stackable = true; // cosmetics can have count > 1; never treat as binary-owned
     }
 
     // Mastery rank per item from XPInfo.
@@ -6178,6 +6779,7 @@ fn build_inventory_from_blob(
     InventoryStateCache {
         items,
         mastery_rank: if blob.mastery_level > 0 { Some(blob.mastery_level) } else { None },
+        rivens: blob.rivens.clone(),
     }
 }
 
@@ -6293,13 +6895,21 @@ pub fn run() {
     let raw_scan_path = data_dir.join("raw_scan.txt");
     let blob_log_dir = data_dir.join("blobs");
     let _ = std::fs::create_dir_all(&blob_log_dir);
+    let api_log_dir = data_dir.join("api_logs");
+    let _ = std::fs::create_dir_all(&api_log_dir);
     let wfm_top_cache_path = data_dir.join("wfm_top_cache.json");
     let syndicate_catalog_path = data_dir.join("syndicate_catalog.json");
+    let auction_ids_path = data_dir.join("auction_ids.json");
+    let initial_auction_ids: Vec<String> = std::fs::read_to_string(&auction_ids_path)
+        .ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
 
     let conn = db::init_db(&db_path).expect("Failed to initialize database");
 
     let initial_items = load_items_cache(&items_cache_path)
         .unwrap_or_else(wfcd::fallback_items);
+    let initial_weapon_dispositions: HashMap<String, f32> = initial_items.iter()
+        .filter_map(|i| i.omega_attenuation.map(|d| (i.unique_name.clone(), d)))
+        .collect();
     let initial_recipes = load_recipes_cache(&recipes_cache_path);
     let initial_relic_drops: HashMap<String, Vec<String>> = std::fs::read_to_string(&relic_drops_cache_path)
         .ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
@@ -6369,6 +6979,7 @@ pub fn run() {
             relic_rewards: Mutex::new(initial_relic_rewards),
             blueprint_to_result: Mutex::new(HashMap::new()),
             wiki_reward_names: Mutex::new(std::collections::HashSet::new()),
+            weapon_dispositions: Mutex::new(initial_weapon_dispositions),
             current_quantities: Arc::new(Mutex::new(initial_quantities)),
             unique_quantities: Arc::new(Mutex::new(initial_unique)),
             current_mods: Arc::new(Mutex::new(initial_mods)),
@@ -6381,6 +6992,8 @@ pub fn run() {
             raw_scan_path,
             blob_log_enabled: Arc::new(AtomicBool::new(false)),
             blob_log_dir,
+            api_log_enabled: Arc::new(AtomicBool::new(false)),
+            api_log_dir,
             wfm_price_cache: Arc::new(Mutex::new(HashMap::new())),
             wfm_session: Arc::new(Mutex::new(None)),
             wfm_price_queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
@@ -6389,6 +7002,8 @@ pub fn run() {
             wfm_top_cache_path,
             syndicate_catalog: Mutex::new(initial_syndicate_catalog),
             syndicate_catalog_path,
+            auction_ids: Mutex::new(initial_auction_ids),
+            auction_ids_path,
         })
         .setup(|app| {
             use tauri::Manager;
@@ -6428,6 +7043,7 @@ pub fn run() {
             toggle_raw_scan,
             capture_inventory_blob,
             set_blob_log,
+            set_api_log,
             get_app_version,
             set_app_version,
             get_craftable_items,
@@ -6459,6 +7075,7 @@ pub fn run() {
             ocr_riven_screen,
             get_riven_session_log,
             wfm_debug_dump,
+            wfm_get_riven_attributes,
             wfm_get_item_orders,
             wfm_get_item_statistics,
             wfm_open_login_window,
@@ -6479,12 +7096,18 @@ pub fn run() {
             wfm_create_order,
             wfm_update_order,
             wfm_delete_order,
+            wfm_create_riven_auction,
+            wfm_get_my_riven_auctions,
+            wfm_delete_auction,
+            wfm_set_auction_visible,
             scan_warframe_credentials,
             scan_warframe_api_urls,
             warframe_login,
             fetch_warframe_inventory,
             save_mastery_data,
             get_saved_inventory,
+            get_rivens,
+            get_weapon_dispositions,
             save_api_inventory,
             get_syndicate_stores,
             fetch_worldstate,
@@ -6494,6 +7117,9 @@ pub fn run() {
             clear_diag_folder,
             save_auto_diag_capture,
             capture_diagnostics,
+            open_debug_folder,
+            clear_debug_data,
+            get_debug_data_size,
             start_monitor,
             stop_monitor,
             get_monitor_status,

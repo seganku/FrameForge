@@ -37,6 +37,23 @@ interface WfmWhisper {
 
 interface WfmItemEntry { id: string; item_name: string; url_name: string; }
 
+interface WfmAuction {
+  id:             string;
+  starting_price: number;
+  buyout_price:   number | null;
+  top_bid:        number | null;
+  bids:           number;
+  winner:         { ingame_name: string } | null;
+  is_closed:      boolean;
+  visible:        boolean;
+  item: {
+    weapon_url_name: string;
+    name:            string;
+    mod_rank:        number;
+    re_rolls:        number;
+  };
+}
+
 interface Props {
   wfmLookup: Map<string, string>;
   wfmItems: WfmItemEntry[];
@@ -44,16 +61,25 @@ interface Props {
   inventory: Record<string, unknown>;
   onNewWhisper: () => void;
   onLoginChange: (username: string | null) => void;
+  auctionRefreshKey?: number;
 }
 
 function fmt(n: number) { return n.toLocaleString(); }
 
-/** Debug helper: call from browser console via window.__wfmDump('/v2/orders/my') */
+/** Debug helpers available from the browser console:
+ *  window.__wfmDump('/v2/orders/my')   — raw JSON from any authenticated WFM endpoint
+ *  window.__wfmAttrs()                  — list all valid riven attribute url_names
+ */
 if (typeof window !== "undefined") {
   (window as unknown as Record<string, unknown>).__wfmDump = async (path: string) => {
     const result = await invoke<string>("wfm_debug_dump", { path }).catch(e => String(e));
     console.log(result);
     return result;
+  };
+  (window as unknown as Record<string, unknown>).__wfmAttrs = async () => {
+    const list = await invoke<string[]>("wfm_get_riven_attributes").catch(e => [String(e)]);
+    console.log(list.join("\n"));
+    return list;
   };
 }
 
@@ -165,8 +191,85 @@ function orderName(o: WfmOrder, itemIdMap: Map<string, string>): string {
   );
 }
 
-function ListingsPanel({ username: _username, itemIdMap, wfmItems, imageMap }: {
+function RivenAuctionsSection({ auctionRefreshKey }: { auctionRefreshKey?: number }) {
+  const [auctions, setAuctions] = useState<WfmAuction[]>([]);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    setBusy(true);
+    try {
+      const res = await invokeWfm<{ payload?: { auctions?: WfmAuction[] } }>("wfm_get_my_riven_auctions");
+      const list = (res?.payload?.auctions ?? []).filter((a: WfmAuction) => !a.is_closed);
+      setAuctions([...list].sort((a, b) => (b.visible ? 1 : 0) - (a.visible ? 1 : 0)));
+    } catch {}
+    setBusy(false);
+  }, []); // eslint-disable-line
+
+  useEffect(() => { load(); }, [load, auctionRefreshKey]);
+
+  function toggleVisible(id: string, currentlyVisible: boolean) {
+    invoke("wfm_set_auction_visible", { auctionId: id, visible: !currentlyVisible })
+      .then(() => load())
+      .catch((e: unknown) => alert(String(e)));
+  }
+
+  function deleteAuction(id: string) {
+    invoke("wfm_delete_auction", { auctionId: id })
+      .then(() => load())
+      .catch((e: unknown) => alert(String(e)));
+  }
+
+  return (
+    <div style={{ marginTop: 16 }}>
+      <div className="wfm-section-label">
+        Riven Auctions ({auctions.length})
+        <button className="wfm-refresh-btn" onClick={load} title="Refresh" disabled={busy}>↻</button>
+      </div>
+      {busy ? (
+        <div className="wfm-empty">Loading…</div>
+      ) : auctions.length === 0 ? (
+        <div className="wfm-empty">No active riven auctions. Post from Market → Rivens tab.</div>
+      ) : (
+        <div className="wfm-orders">
+          {auctions.map(a => {
+            const weaponName = a.item.weapon_url_name.replace(/_/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase());
+            const modName = a.item.name ? a.item.name.charAt(0).toUpperCase() + a.item.name.slice(1) : "";
+            return (
+              <div key={a.id} className={`wfm-auction-card${a.visible ? "" : " riven-auction-hidden"}`}>
+                <div className="wfm-auction-card-header">
+                  <span
+                    className="riven-auction-vis"
+                    title={a.visible ? "Visible — click to hide" : "Hidden — click to show"}
+                    onClick={() => toggleVisible(a.id, a.visible)}>
+                    {a.visible ? "👁" : "🚫"}
+                  </span>
+                  <span className="wfm-order-name">
+                    {weaponName}{modName && <span className="riven-mod-name"> {modName}</span>}
+                  </span>
+                  <button className="wfm-btn-sm wfm-btn-del" onClick={() => deleteAuction(a.id)}>✕</button>
+                </div>
+                <div className="wfm-auction-card-details">
+                  <span className="wfm-auction-stat"><span className="wfm-auction-label">Start</span> {a.starting_price}p</span>
+                  <span className="wfm-auction-stat"><span className="wfm-auction-label">Buyout</span> {a.buyout_price != null ? `${a.buyout_price}p` : "—"}</span>
+                  <span className="wfm-auction-stat"><span className="wfm-auction-label">Bids</span> {a.bids ?? 0}</span>
+                  {a.top_bid != null && (
+                    <span className="wfm-auction-stat wfm-auction-topbid">
+                      <span className="wfm-auction-label">Top</span> {a.top_bid}p{a.winner && <span className="wfm-auction-bidder"> · {a.winner.ingame_name}</span>}
+                    </span>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ListingsPanel({ username: _username, itemIdMap, wfmItems, imageMap, auctionRefreshKey }: {
   username: string; itemIdMap: Map<string, string>; wfmItems: WfmItemEntry[]; imageMap: Map<string, string>;
+  auctionRefreshKey?: number;
 }) {
   const [orders, setOrders] = useState<{ sell: WfmOrder[]; buy: WfmOrder[] }>({ sell: [], buy: [] });
   const [loading, setLoading] = useState(true);
@@ -261,6 +364,7 @@ function ListingsPanel({ username: _username, itemIdMap, wfmItems, imageMap }: {
           }}
         />
       )}
+      <RivenAuctionsSection auctionRefreshKey={auctionRefreshKey} />
     </div>
   );
 }
@@ -508,7 +612,7 @@ function MessagesPanel({ username: _username, wfmItems }: { username: string; wf
 
 // ── Main export ───────────────────────────────────────────────────────────────
 
-export default function WfmTrading({ wfmLookup: _wfmLookup, wfmItems, imageMap, inventory: _inventory, onNewWhisper, onLoginChange }: Props) {
+export default function WfmTrading({ wfmLookup: _wfmLookup, wfmItems, imageMap, inventory: _inventory, onNewWhisper, onLoginChange, auctionRefreshKey }: Props) {
   const [tab, setTab]           = useState<"listings" | "messages">("listings");
   const [username, setUsername]         = useState<string | null>(null);
   const [checking, setChecking]         = useState(true);
@@ -555,6 +659,9 @@ export default function WfmTrading({ wfmLookup: _wfmLookup, wfmItems, imageMap, 
         if (creds) {
           try {
             [resolvedUser] = await invoke<[string, string]>("wfm_set_jwt", { jwt: creds[1] });
+            // Re-save with any newly-fetched CSRF token so it persists across restarts
+            const tokenJson = await invoke<string | null>("wfm_get_jwt").catch(() => null);
+            if (tokenJson) await invoke("wfm_save_credentials", { email: "token", password: tokenJson }).catch(() => {});
           } catch { /* token expired — show login form */ }
         }
       }
@@ -656,7 +763,7 @@ export default function WfmTrading({ wfmLookup: _wfmLookup, wfmItems, imageMap, 
       )}
 
       {tab === "listings"
-        ? <ListingsPanel username={username} itemIdMap={new Map(wfmItems.map(i => [i.id, i.item_name]))} wfmItems={wfmItems} imageMap={imageMap} />
+        ? <ListingsPanel username={username} itemIdMap={new Map(wfmItems.map(i => [i.id, i.item_name]))} wfmItems={wfmItems} imageMap={imageMap} auctionRefreshKey={auctionRefreshKey} />
         : <MessagesPanel username={username} wfmItems={wfmItems} />
       }
     </div>

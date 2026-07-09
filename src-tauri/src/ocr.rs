@@ -20,7 +20,7 @@ fn avg_brightness(pixels: &[u8]) -> u32 {
 
 /// Main entry point. Tries PrintWindow first, falls back to DXGI if the frame is dark.
 /// Returns (BGRA pixels, width, captured_height, full_height, capture_info).
-/// captured_height covers the top 48% of the full window — reward cards are always in the
+/// captured_height covers the top 85% of the full window — reward cards are always in the
 /// upper half of the screen. OCR line filtering (y >= 0.10 of cap_h) removes any HUD text
 /// from the very top of the frame (FPS counters, ping overlays, etc.) without cropping.
 /// capture_info describes which path was used and the pixel brightness, for session logging.
@@ -35,7 +35,7 @@ pub fn capture_warframe_reward_area() -> Option<(Vec<u8>, u32, u32, u32, String)
         }
         // Dark frame — Fullscreen Exclusive likely. Fall through to DXGI.
         let _ = avg;
-        if let Some((px2, w2, cap_h2, full_h2)) = capture_dxgi(0.75) {
+        if let Some((px2, w2, cap_h2, full_h2)) = capture_dxgi(0.85) {
             let avg2 = avg_brightness(&px2);
             let info = format!(
                 "DXGI  {}×{}px (top 75%, cap {}px)  avg_brightness={} \
@@ -54,7 +54,7 @@ pub fn capture_warframe_reward_area() -> Option<(Vec<u8>, u32, u32, u32, String)
     }
 
     // PrintWindow found no window (Warframe not running?) — try DXGI anyway
-    if let Some((pixels, w, cap_h, full_h)) = capture_dxgi(0.75) {
+    if let Some((pixels, w, cap_h, full_h)) = capture_dxgi(0.85) {
         let avg = avg_brightness(&pixels);
         let info = format!(
             "DXGI  {}×{}px (top 75%, cap {}px)  avg_brightness={} (no Warframe window found)",
@@ -94,7 +94,7 @@ fn capture_printwindow() -> Option<(Vec<u8>, u32, u32, u32)> {
         let full_h = (rect.bottom - rect.top) as u32;
         if full_w < 100 || full_h < 100 { return None; }
 
-        let cap_h = (full_h as f32 * 0.75) as u32;
+        let cap_h = (full_h as f32 * 0.85) as u32;
 
         let hdc_win = GetDC(hwnd);
         let hdc_mem = CreateCompatibleDC(hdc_win);
@@ -1370,12 +1370,12 @@ pub fn extract_reward_items_twophase(
     let is_prime_like = |w: &str| -> bool {
         if w.starts_with("prim") && w.len() >= 4 { return true; }
         if w == "pri" { return true; }  // OCR truncation: "Lavos Prime" → "Lavos Pri"
-        if w.len() >= 3 && w.len() <= 7 { return lev_dist(w, "prime") <= 1; }
+        if w.len() >= 3 && w.len() <= 9 { return lev_dist(w, "prime") <= 1; }
         false
     };
     let is_forma_like = |w: &str| -> bool {
         if w == "forma" { return true; }
-        if w.len() >= 4 && w.len() <= 6 { return lev_dist(w, "forma") <= 1; }
+        if w.len() >= 3 && w.len() <= 7 { return lev_dist(w, "forma") <= 1; }
         false
     };
     let prime_count = raw_norm.split_whitespace().filter(|&w| is_prime_like(w)).count();
@@ -1816,6 +1816,18 @@ pub fn extract_reward_items_twophase(
 }
 
 
+
+/// Captures the full composited desktop for diagnostics.
+/// Uses DXGI Desktop Duplication so the result includes all windows (including transparent overlays).
+/// Returns (BGRA pixels, width, height) or None on failure.
+#[cfg(target_os = "windows")]
+pub fn capture_desktop_for_diag() -> Option<(Vec<u8>, u32, u32)> {
+    let (pixels, w, cap_h, _full_h) = capture_dxgi(1.0)?;
+    Some((pixels, w, cap_h))
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn capture_desktop_for_diag() -> Option<(Vec<u8>, u32, u32)> { None }
 
 #[cfg(not(target_os = "windows"))]
 pub fn capture_warframe_reward_area() -> Option<(Vec<u8>, u32, u32, u32, String)> { None }

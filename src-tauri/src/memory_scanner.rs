@@ -9,6 +9,64 @@ pub struct ModCount {
     pub by_rank: HashMap<u8, i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BlobRivenStat {
+    pub tag:   String,
+    pub value: i64,
+}
+
+/// Which stage of unlocking a riven is at. Matches warframe.market terminology.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum RivenState {
+    /// From RawUpgrades — only the weapon type (Rifle/Pistol/Melee…) is visible.
+    Unrevealed,
+    /// From Upgrades with a `challenge` fingerprint but no `compat` — challenge is visible
+    /// but not yet completed; weapon has not been assigned.
+    Revealed,
+    /// From Upgrades with a `compat` — weapon assigned, stats fully visible.
+    #[default]
+    Unlocked,
+}
+
+/// One owned riven mod (unrevealed, revealed, or fully unlocked).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlobRivenEntry {
+    /// MongoDB ObjectId hex string (empty for unrevealed stacks).
+    pub item_id:  String,
+    /// Lotus path, e.g. /Lotus/Upgrades/Mods/Randomized/LotusMeleeRandomModRare
+    pub item_type: String,
+    /// Which stage this riven is at (unrevealed / revealed / unlocked).
+    /// Old cache entries without this field default to Unlocked.
+    #[serde(default)]
+    pub riven_state: RivenState,
+    /// Weapon unique_name from `compat` field. Only present for Unlocked rivens.
+    pub compat:   Option<String>,
+    /// Challenge path from fingerprint. Only present for Revealed rivens.
+    /// e.g. "/Lotus/Types/Challenges/HighExterminationUndetected"
+    #[serde(default)]
+    pub challenge_type: Option<String>,
+    /// Complication path. e.g. "/Lotus/Types/Challenges/Complications/SoloPlayer"
+    #[serde(default)]
+    pub challenge_complication: Option<String>,
+    /// MR required to equip.
+    pub lvl_req:  Option<u32>,
+    /// Polarity slot (AP_ATTACK, AP_DEFENSE, etc.).
+    pub polarity: Option<String>,
+    pub buffs:    Vec<BlobRivenStat>,
+    pub curses:   Vec<BlobRivenStat>,
+    /// Current mod level (rank).
+    pub mod_rank: u8,
+    /// >1 for stacked unrevealed rivens of the same type.
+    pub count:    u32,
+    /// Number of times this riven has been re-rolled (Kuva spent). 0 = never rolled.
+    #[serde(default)]
+    pub rerolls:  u32,
+    /// Generated riven mod name (e.g. "cronitron"). Computed from buffs at parse time.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mod_name: String,
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct PendingRecipe {
     pub unique_name: String,
@@ -50,6 +108,8 @@ pub struct BlobInventory {
     pub pending_recipes: Vec<BlobPendingRecipe>,
     /// Warframe paths fed to Helminth (InfestedFoundry.ConsumedSuits).
     pub consumed_suits:  Vec<String>,
+    /// All owned riven mods (veiled and revealed).
+    pub rivens:          Vec<BlobRivenEntry>,
 }
 
 /// One owned unique item (warframe, weapon, companion, archwing, amp, mech).
@@ -464,24 +524,92 @@ pub fn capture_inventory_blob(_output_path: &std::path::Path) -> Result<String, 
 /// "Relevant" = region ≥ 100 KB that contains at least one of: MiscItems, Suits,
 // ─── Full-account blob parser ─────────────────────────────────────────────────
 
+/// Find the end of the FULL_ACCOUNT blob by locating `"DeathSquadable":` and
+/// the `}` that immediately follows its boolean value (true or false).
+fn find_blob_end(raw: &[u8]) -> Option<usize> {
+    const KEY: &[u8] = b"\"DeathSquadable\":";
+    let key_pos = raw.windows(KEY.len()).position(|w| w == KEY)?;
+    let after   = key_pos + KEY.len();
+    // Skip the boolean value and find the closing brace
+    let brace = raw[after..].iter().position(|&b| b == b'}')?;
+    Some(after + brace + 1)
+}
+
 /// Parse a FULL_ACCOUNT blob from raw memory bytes into structured inventory data.
 ///
-/// `raw` must span at minimum from `"SubscribedToEmails"` through `"DeathSquadable":false}`.
-/// Returns `None` if the start marker is missing or JSON is malformed.
+/// Compute the deterministic riven mod name from its buff stats.
+/// Mirrors the RIVEN_NAME_PARTS table in MarketHelper.tsx.
+/// 1 buff  → coreSuffix       (buff's prefix word + buff's suffix word)
+/// 2 buffs → coreSuffix       (higher's prefix + lower's suffix, no dash)
+/// 3 buffs → prefix-coreSuffix (highest - second + lowest, with dash)
+pub fn compute_riven_mod_name(buffs: &[BlobRivenStat]) -> String {
+    fn parts(tag: &str) -> Option<(&'static str, &'static str)> {
+        match tag {
+            "WeaponMeleeComboBonusOnHitMod" | "WeaponMeleeComboPointsOnHitMod" => Some(("Laci",  "Nus"  )),
+            "WeaponAmmoMaxMod"                                                  => Some(("Ampi",  "Bin"  )),
+            "WeaponMeleeFactionDamageCorpus"   | "WeaponFactionDamageCorpus"   => Some(("Manti", "Tron" )),
+            "WeaponMeleeFactionDamageGrineer"  | "WeaponFactionDamageGrineer"  => Some(("Argi",  "Con"  )),
+            "WeaponMeleeFactionDamageInfested" | "WeaponFactionDamageInfested" => Some(("Pura",  "Ada"  )),
+            "WeaponFreezeDamageMod"            => Some(("Geli",  "Do"   )),
+            "ComboDurationMod"                 => Some(("Tempi", "Nem"  )),
+            "WeaponCritChanceMod"              => Some(("Crita", "Cron" )),
+            "SlideAttackCritChanceMod"         => Some(("Pleci", "Nent" )),
+            "WeaponCritDamageMod"              => Some(("Acri",  "Tis"  )),
+            "WeaponDamageAmountMod" | "WeaponMeleeDamageMod" => Some(("Visi", "Ata")),
+            "WeaponElectricityDamageMod"       => Some(("Vexi",  "Tio"  )),
+            "WeaponFireDamageMod"              => Some(("Igni",  "Pha"  )),
+            "WeaponMeleeFinisherDamageMod"     => Some(("Exi",   "Cta"  )),
+            "WeaponFireRateMod"                => Some(("Croni", "Dra"  )),
+            "WeaponProjectileSpeedMod"         => Some(("Conci", "Nak"  )),
+            "WeaponMeleeComboInitialBonusMod"  => Some(("Para",  "Um"   )),
+            "WeaponImpactDamageMod"            => Some(("Magna", "Ton"  )),
+            "WeaponClipMaxMod"                 => Some(("Arma",  "Tin"  )),
+            "WeaponMeleeComboEfficiencyMod"    => Some(("Forti", "Us"   )),
+            "WeaponFireIterationsMod"          => Some(("Sati",  "Can"  )),
+            "WeaponToxinDamageMod"             => Some(("Toxi",  "Tox"  )),
+            "WeaponPunctureDepthMod"           => Some(("Lexi",  "Nok"  )),
+            "WeaponArmorPiercingDamageMod"     => Some(("Insi",  "Cak"  )),
+            "WeaponReloadSpeedMod"             => Some(("Feva",  "Tak"  )),
+            "WeaponMeleeRangeIncMod"           => Some(("Locti", "Tor"  )),
+            "WeaponSlashDamageMod"             => Some(("Sci",   "Sus"  )),
+            "WeaponStunChanceMod"              => Some(("Hexa",  "Dex"  )),
+            "WeaponProcTimeMod"                => Some(("Deci",  "Des"  )),
+            "WeaponRecoilReductionMod"         => Some(("Zeti",  "Mag"  )),
+            "WeaponZoomFovMod"                 => Some(("Hera",  "Lis"  )),
+            _ => None,
+        }
+    }
+    if buffs.is_empty() { return String::new(); }
+    let mut sorted: Vec<&BlobRivenStat> = buffs.iter().collect();
+    sorted.sort_by(|a, b| b.value.cmp(&a.value));
+    let Some((hi_p, _))  = parts(&sorted[0].tag)                   else { return String::new(); };
+    let Some((_, lo_s))  = parts(&sorted[sorted.len() - 1].tag)    else { return String::new(); };
+    if sorted.len() >= 3 {
+        if let Some((mid_p, _)) = parts(&sorted[1].tag) {
+            return format!("{}-{}{}", hi_p.to_lowercase(), mid_p.to_lowercase(), lo_s.to_lowercase());
+        }
+    }
+    format!("{}{}", hi_p.to_lowercase(), lo_s.to_lowercase())
+}
+
+/// `raw` must span from the JSON opening `{` (or from `"SubscribedToEmails"`) through
+/// `"DeathSquadable":`. Returns `None` if neither start can be located or JSON is malformed.
 pub fn parse_full_account_blob(raw: &[u8]) -> Option<BlobInventory> {
-    const START: &[u8] = b"\"SubscribedToEmails\"";
-    const END:   &[u8] = b"\"DeathSquadable\":false}";
+    let end_pos = find_blob_end(raw)?;
 
-    let start_pos = raw.windows(START.len()).position(|w| w == START)?;
-    let end_pos   = raw.windows(END.len()).position(|w| w == END)
-        .map(|p| p + END.len())
-        .unwrap_or(raw.len());
-
-    // Build a valid JSON object: { + content from "SubscribedToEmails" through "DeathSquadable":false}
-    // raw[start_pos..end_pos] already ends with } (the outer closing brace) — don't add another one.
-    let mut json_bytes = Vec::with_capacity(end_pos - start_pos + 1);
-    json_bytes.push(b'{');
-    json_bytes.extend_from_slice(&raw[start_pos..end_pos]);
+    // capture_all_blobs seeds from the JSON opening { so raw already forms a complete
+    // JSON object — use it directly. Fall back to the old SubscribedToEmails approach
+    // for any caller that still passes data starting inside the object.
+    let json_bytes: Vec<u8> = if raw.first() == Some(&b'{') {
+        raw[..end_pos].to_vec()
+    } else {
+        const START: &[u8] = b"\"SubscribedToEmails\"";
+        let start_pos = raw.windows(START.len()).position(|w| w == START)?;
+        let mut v = Vec::with_capacity(end_pos - start_pos + 1);
+        v.push(b'{');
+        v.extend_from_slice(&raw[start_pos..end_pos]);
+        v
+    };
 
     let json: serde_json::Value = serde_json::from_slice(&json_bytes)
         .map_err(|e| eprintln!("[blob-parse] JSON error: {}", e))
@@ -552,7 +680,9 @@ pub fn parse_full_account_blob(raw: &[u8]) -> Option<BlobInventory> {
         }
     }
 
-    // Mods: RawUpgrades (unranked, ItemCount) + Upgrades (ranked, one entry = one copy)
+    // Rivens + Mods: RawUpgrades (unranked, ItemCount) + Upgrades (ranked, one entry = one copy).
+    // Riven paths contain "RandomMod" — extract them separately and skip from mods map.
+    let mut rivens: Vec<BlobRivenEntry> = Vec::new();
     let mut mods: HashMap<String, ModCount> = HashMap::new();
     if let Some(arr) = json["RawUpgrades"].as_array() {
         for e in arr {
@@ -560,6 +690,20 @@ pub fn parse_full_account_blob(raw: &[u8]) -> Option<BlobInventory> {
             if !it.starts_with("/Lotus/") { continue; }
             let count = e["ItemCount"].as_i64().unwrap_or(0);
             if count <= 0 { continue; }
+            if it.contains("RandomMod") {
+                // Unrevealed riven: stacked in RawUpgrades, only type visible.
+                rivens.push(BlobRivenEntry {
+                    item_id:  String::new(),
+                    item_type: it.to_string(),
+                    riven_state: RivenState::Unrevealed,
+                    compat: None, challenge_type: None, challenge_complication: None,
+                    lvl_req: None, polarity: None,
+                    buffs: vec![], curses: vec![],
+                    mod_rank: 0, count: count as u32, rerolls: 0,
+                    mod_name: String::new(),
+                });
+                continue;
+            }
             let mc = mods.entry(it.to_string()).or_default();
             *mc.by_rank.entry(0).or_insert(0) += count;
             mc.total += count;
@@ -569,6 +713,57 @@ pub fn parse_full_account_blob(raw: &[u8]) -> Option<BlobInventory> {
         for e in arr {
             let Some(it) = e["ItemType"].as_str() else { continue };
             if !it.starts_with("/Lotus/") { continue; }
+            if it.contains("RandomMod") {
+                let fp_str = e["UpgradeFingerprint"].as_str().unwrap_or("{}");
+                if let Ok(fp) = serde_json::from_str::<serde_json::Value>(fp_str) {
+                    let item_id = e["ItemId"]["$oid"].as_str().unwrap_or("").to_string();
+                    if let Some(compat) = fp["compat"].as_str() {
+                        // Unlocked riven: weapon assigned + stats visible.
+                        let buffs: Vec<BlobRivenStat> = fp["buffs"].as_array()
+                            .map(|a| a.iter().filter_map(|s| Some(BlobRivenStat {
+                                tag:   s["Tag"].as_str()?.to_string(),
+                                value: s["Value"].as_i64().unwrap_or(0),
+                            })).collect())
+                            .unwrap_or_default();
+                        let curses: Vec<BlobRivenStat> = fp["curses"].as_array()
+                            .map(|a| a.iter().filter_map(|s| Some(BlobRivenStat {
+                                tag:   s["Tag"].as_str()?.to_string(),
+                                value: s["Value"].as_i64().unwrap_or(0),
+                            })).collect())
+                            .unwrap_or_default();
+                        let mod_name = compute_riven_mod_name(&buffs);
+                        rivens.push(BlobRivenEntry {
+                            item_id, item_type: it.to_string(),
+                            riven_state: RivenState::Unlocked,
+                            compat: Some(compat.to_string()),
+                            challenge_type: None, challenge_complication: None,
+                            lvl_req:  fp["lvlReq"].as_u64().map(|v| v as u32),
+                            polarity: fp["pol"].as_str().map(String::from),
+                            mod_rank: fp["lvl"].as_u64().map(|v| v as u8).unwrap_or(0),
+                            count: 1,
+                            rerolls: fp["rerolls"].as_u64().unwrap_or(0) as u32,
+                            mod_name,
+                            buffs,
+                            curses,
+                        });
+                        continue;
+                    } else if fp["challenge"].is_object() {
+                        // Revealed riven: challenge assigned but not yet completed.
+                        let challenge_type = fp["challenge"]["Type"].as_str().map(String::from);
+                        let challenge_complication = fp["challenge"]["Complication"].as_str().map(String::from);
+                        rivens.push(BlobRivenEntry {
+                            item_id, item_type: it.to_string(),
+                            riven_state: RivenState::Revealed,
+                            compat: None, challenge_type, challenge_complication,
+                            lvl_req: None, polarity: None,
+                            buffs: vec![], curses: vec![],
+                            mod_rank: 0, count: 1, rerolls: 0,
+                            mod_name: String::new(),
+                        });
+                        continue;
+                    }
+                }
+            }
             let rank = blob_extract_mod_rank(e["UpgradeFingerprint"].as_str());
             let mc = mods.entry(it.to_string()).or_default();
             *mc.by_rank.entry(rank).or_insert(0) += 1;
@@ -630,6 +825,7 @@ pub fn parse_full_account_blob(raw: &[u8]) -> Option<BlobInventory> {
         credits, endo, platinum, free_platinum, mastery_level,
         unique_items, stackable_items, mods,
         flavour_items, weapon_skins, mastery_data, pending_recipes, consumed_suits,
+        rivens,
     })
 }
 
@@ -648,16 +844,35 @@ fn blob_extract_mod_rank(fingerprint: Option<&str>) -> u8 {
 
 // ─── Blob capture ─────────────────────────────────────────────────────────────
 
-/// Scans Warframe process memory for inventory blobs and saves them to `blob_dir`.
-/// Only saves FULL_ACCOUNT blobs (the authoritative inventory root).
-/// When a FULL_ACCOUNT blob is found, parses it and sends it through `blob_tx`.
+// Cache: remember the region address where the blob was last successfully found.
+// On the next cycle we probe that address first — if the blob is still there we
+// finish in milliseconds instead of walking the full address space.
+static LAST_BLOB_REGION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Scans Warframe process memory for the FULL_ACCOUNT inventory blob and sends it
+/// through `blob_tx` for the monitor loop to apply.
 ///
-/// LongGuns, Melee, Pistols, InventoryChanges (covers real inventory and mission blobs).
+/// Multi-scan strategy: the blob may span many memory regions and multiple copies
+/// can exist at different addresses. We track every potential start point as a
+/// separate in-flight scan and stitch them all in parallel as the region walk
+/// advances. The first scan that produces a valid JSON blob wins; all others are
+/// dropped. This is far more robust than the old single-start approach when the
+/// blob is large or when the first start hit leads to a truncated region.
 ///
-/// Naming convention:
-///   Actual_inventory_FULL_ACCOUNT_<ts>.json — the authoritative full account blob
+/// Algorithm:
+///   1. Walk every committed readable region.
+///   2. If a region has START_MARKER ("SubscribedToEmails") and is NOT a mission
+///      delta ("InventoryChanges"), open a new ActiveScan seeded with that region's
+///      data from the START_MARKER offset onwards.
+///   3. Every readable region is appended to ALL active scans (stitching).
+///   4. After each append, check every scan for the end marker. If found, parse it.
+///      On success send the inventory to the monitor loop. On failure drop the scan.
+///      The walk always continues through all of memory — every blob start is found.
+///   5. Drop any scan that grows past MAX_SCAN_BYTES without finding the end.
 ///
-/// Returns the number of blobs saved.
+/// When `save=true` also writes the raw text to `blob_dir` for debugging.
+/// Returns the number of files written (always 0 when `save=false`).
 #[cfg(target_os = "windows")]
 pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::sync::mpsc::Sender<BlobInventory>, save: bool) -> usize {
     use std::ffi::c_void;
@@ -675,8 +890,21 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
     let process = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid) };
     if process == 0 { return 0; }
 
-    const MIN_BLOB_BYTES: usize = 100_000;
-    const MAX_REGION_READ: usize = 64 * 1024 * 1024;
+    const MIN_REGION:    usize = 64_000;   // skip regions smaller than 64 KB
+    const MAX_READ:      usize = 64  * 1024 * 1024;
+    const MAX_SCAN:      usize = 20  * 1024 * 1024;
+    const MAX_BLOBS:     usize = 25;
+
+    // Executable pages never contain heap data — safe to skip.
+    const PAGE_EXECUTE:      u32 = 0x10;
+    const PAGE_EXECUTE_READ: u32 = 0x20;
+    const PAGE_EXECUTE_RW:   u32 = 0x40;
+    const PAGE_EXECUTE_WC:   u32 = 0x80;
+    const EXEC_MASK: u32 = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_RW | PAGE_EXECUTE_WC;
+
+    const START_MARKER:  &[u8] = b"\"SubscribedToEmails\"";
+    const MISSION_DELTA: &[u8] = b"\"InventoryChanges\":";
+    const LOTUS_KEY:     &[u8] = b"/Lotus/";
     const ANCHORS: &[&[u8]] = &[
         b"\"SubscribedToEmails\"",
         b"\"MiscItems\":[",
@@ -685,147 +913,255 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
         b"\"Melee\":[",
         b"\"Pistols\":[",
     ];
-    // The FULL_ACCOUNT blob always starts with "SubscribedToEmails" — same marker
-    // that parse_full_account_blob uses to find the beginning of the JSON payload.
-    const START_MARKER:   &[u8] = b"\"SubscribedToEmails\"";
-    const LOTUS_KEY:      &[u8] = b"/Lotus/";
-    const MAX_BLOBS: usize = 25;
+
+    // ── Fast path: try the cached region from last successful scan ─────────────
+    // If the blob is still at the same address, we skip the entire memory walk.
+    let cached_addr = LAST_BLOB_REGION.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    if cached_addr != 0 && !save {
+        let mut mbi = unsafe { mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
+        let ok = unsafe { VirtualQueryEx(process, cached_addr as *const c_void, &mut mbi,
+            mem::size_of::<MEMORY_BASIC_INFORMATION>()) } != 0;
+        if ok && mbi.State == MEM_COMMIT
+            && mbi.Protect & PAGE_GUARD == 0
+            && mbi.Protect & PAGE_NOACCESS == 0
+        {
+            let read_cap = mbi.RegionSize.min(MAX_READ);
+            let mut buf = vec![0u8; read_cap];
+            let mut n = 0usize;
+            let read_ok = unsafe { ReadProcessMemory(process, cached_addr as *const c_void,
+                buf.as_mut_ptr() as *mut c_void, read_cap, &mut n) } != 0 && n >= 8;
+            if read_ok {
+                let chunk = &buf[..n];
+                let has_start = chunk.windows(START_MARKER.len()).any(|w| w == START_MARKER);
+                let is_mission = chunk.windows(MISSION_DELTA.len()).any(|w| w == MISSION_DELTA);
+                if has_start && !is_mission {
+                    // Stitch forward from the cached region using the same approach as the main walk.
+                    // Seed from the JSON opening { which may precede "SubscribedToEmails" — field
+                    // order in the FULL_ACCOUNT blob varies by account.
+                    let start_off = chunk.windows(START_MARKER.len())
+                        .position(|w| w == START_MARKER).unwrap_or(0);
+                    let json_open = chunk[..start_off + 1]
+                        .windows(2)
+                        .position(|w| w == b"{\"")
+                        .unwrap_or(start_off);
+                    let mut stitched = chunk[json_open..].to_vec();
+                    let mut walk = cached_addr + n;
+                    while stitched.len() < MAX_SCAN && find_blob_end(&stitched).is_none() {
+                        let mut nmbi = unsafe { mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
+                        if unsafe { VirtualQueryEx(process, walk as *const c_void, &mut nmbi,
+                            mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 { break; }
+                        let nr = nmbi.BaseAddress as usize;
+                        let ns = nmbi.RegionSize;
+                        walk = nr + ns;
+                        if nmbi.State != MEM_COMMIT
+                            || nmbi.Protect & PAGE_GUARD != 0
+                            || nmbi.Protect & PAGE_NOACCESS != 0
+                            || ns == 0 { continue; }
+                        let cap = ns.min(MAX_READ);
+                        let mut nb = vec![0u8; cap];
+                        let mut nn = 0usize;
+                        if unsafe { ReadProcessMemory(process, nr as *const c_void,
+                            nb.as_mut_ptr() as *mut c_void, cap, &mut nn) } == 0 { continue; }
+                        stitched.extend_from_slice(&nb[..nn]);
+                    }
+                    if let Some(inv) = parse_full_account_blob(&stitched) {
+                        eprintln!("[blob] fast-path hit at 0x{:012x}: {} unique, {} stackable",
+                            cached_addr, inv.unique_items.len(), inv.stackable_items.len());
+                        blob_tx.send(inv).ok();
+                        unsafe { CloseHandle(process); }
+                        return 0; // fast path never saves to disk
+                    }
+                }
+            }
+        }
+        // Cache miss — fall through to full walk and update the cache when found
+        eprintln!("[blob] fast-path miss at 0x{:012x} — doing full walk", cached_addr);
+    }
+
+    struct ActiveScan {
+        data: Vec<u8>,
+        id: usize,
+        /// Base address of the region where this scan was seeded (JSON start).
+        /// Used to update LAST_BLOB_REGION correctly for multi-region blobs.
+        start_region_addr: usize,
+        /// Minimum offset at which the end-marker search should start next append.
+        /// Avoids rescanning already-checked data on every region append (O(n²) → O(n)).
+        search_from: usize,
+    }
+    let mut scans: Vec<ActiveScan> = Vec::new();
+    let mut next_scan_id = 0usize;
 
     let mut addr: usize = 0;
     let mut saved = 0usize;
-    let mut regions_scanned = 0usize;
-    let mut anchor_hits = 0usize;
+    let mut regions_skipped = 0usize;
+    let mut regions_read    = 0usize;
+    let mut starts_found    = 0usize;
+    let mut t_vquery = std::time::Duration::ZERO;
+    let mut t_read   = std::time::Duration::ZERO;
+    let mut t_search = std::time::Duration::ZERO;
+    let mut bytes_read: u64 = 0;
+    // Once we have at least one successful parse we stop opening new scans.
+    // Active scans already in progress are still stitched to completion (or dropped).
+    // The loop exits as soon as all active scans are gone.
+    let mut found_result = false;
 
     loop {
         if saved >= MAX_BLOBS { break; }
+        // Early exit: we have a result and no active scans left to finish.
+        if found_result && scans.is_empty() && !save { break; }
+
+        let t0 = std::time::Instant::now();
         let mut mbi = unsafe { mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
-        if unsafe { VirtualQueryEx(process, addr as *const c_void, &mut mbi, mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 { break; }
+        if unsafe { VirtualQueryEx(process, addr as *const c_void, &mut mbi,
+            mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 { break; }
+        t_vquery += t0.elapsed();
+
         let region_addr = mbi.BaseAddress as usize;
         let region_size = mbi.RegionSize;
         let next_addr   = region_addr.saturating_add(region_size);
         if next_addr <= addr { break; }
         addr = next_addr;
 
-        if mbi.State != MEM_COMMIT
-            || mbi.Protect & PAGE_GUARD    != 0
-            || mbi.Protect & PAGE_NOACCESS != 0
-            || region_size < MIN_BLOB_BYTES
-            || region_size > MAX_REGION_READ
-        { continue; }
+        // ── Region filters ──────────────────────────────────────────────────
+        // Skip pages that can never hold heap JSON:
+        // • must be committed and readable
+        // • skip execute-only pages (code sections, JIT stubs)
+        // • skip anything smaller than MIN_REGION
+        if mbi.State   != MEM_COMMIT
+            || mbi.Protect &  PAGE_GUARD    != 0
+            || mbi.Protect &  PAGE_NOACCESS != 0
+            || mbi.Protect &  EXEC_MASK     != 0
+            || region_size  < MIN_REGION
+        { regions_skipped += 1; continue; }
 
-        let mut data = vec![0u8; region_size];
+        let read_cap = region_size.min(MAX_READ);
+
+        let t1 = std::time::Instant::now();
+        let mut buf = vec![0u8; read_cap];
         let mut n = 0usize;
-        if unsafe { ReadProcessMemory(process, region_addr as *const c_void, data.as_mut_ptr() as *mut c_void, region_size, &mut n) } == 0 || n < MIN_BLOB_BYTES { continue; }
-        let data = &data[..n];
+        if unsafe { ReadProcessMemory(process, region_addr as *const c_void,
+            buf.as_mut_ptr() as *mut c_void, read_cap, &mut n) } == 0 || n < 8 {
+            regions_skipped += 1; continue;
+        }
+        t_read += t1.elapsed();
+        bytes_read += n as u64;
+        let chunk = &buf[..n];
+        regions_read += 1;
 
-        regions_scanned += 1;
-
-        // Require at least one anchor hit and a /Lotus/ path before doing any work.
-        let has_anchor = ANCHORS.iter().any(|a| data.windows(a.len()).any(|w| w == *a));
-        if !has_anchor { continue; }
-        if !data.windows(LOTUS_KEY.len()).any(|w| w == LOTUS_KEY) { continue; }
-        anchor_hits += 1;
-
-        // Only stitch from regions that contain the blob start marker.
-        // Mission delta blobs have "InventoryChanges" but NOT "SubscribedToEmails" — skip them.
-        let has_start    = data.windows(START_MARKER.len()).any(|w| w == START_MARKER);
-        let is_mission   = data.windows(b"\"InventoryChanges\":".len()).any(|w| w == b"\"InventoryChanges\":");
-
-        const END_MARKER: &[u8] = b"\"DeathSquadable\":false}";
-
-        let save_data: Vec<u8>;
-
-        if has_start && !is_mission {
-            // Walk forward region by region from Created (the inventory START) and
-            // concatenate until we find "DeathSquadable":false} (the inventory END).
-            // A single large ReadProcessMemory fails when VirtualAlloc regions have
-            // different protection flags between them, leaving the blob truncated.
-            const MAX_STITCH: usize = 10 * 1024 * 1024; // 10 MB safety cap
-            let mut stitched: Vec<u8> = data.to_vec();
-            let mut walk_addr = next_addr; // start of the region after the current one
-
-            while stitched.len() < MAX_STITCH {
-                // Check if we already have the end marker.
-                if stitched.windows(END_MARKER.len()).any(|w| w == END_MARKER) { break; }
-
-                let mut next_mbi = unsafe { mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
-                if unsafe { VirtualQueryEx(process, walk_addr as *const c_void,
-                    &mut next_mbi, mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 { break; }
-
-                let nr_addr = next_mbi.BaseAddress as usize;
-                let nr_size = next_mbi.RegionSize;
-                let nr_next = nr_addr.saturating_add(nr_size);
-                if nr_next <= walk_addr { break; }
-                walk_addr = nr_next;
-
-                // Skip non-readable regions. If we've already collected data, a single
-                // unreadable gap might just be padding — keep walking. Stop after 3 gaps.
-                if next_mbi.State != MEM_COMMIT
-                    || next_mbi.Protect & PAGE_GUARD    != 0
-                    || next_mbi.Protect & PAGE_NOACCESS != 0
-                    || nr_size == 0
-                    || nr_size > MAX_REGION_READ
-                { continue; }
-
-                let mut nr_data = vec![0u8; nr_size];
-                let mut nr_n = 0usize;
-                if unsafe { ReadProcessMemory(process, nr_addr as *const c_void,
-                    nr_data.as_mut_ptr() as *mut c_void, nr_size, &mut nr_n) } == 0
-                    || nr_n == 0 { continue; }
-
-                stitched.extend_from_slice(&nr_data[..nr_n]);
+        // ── Step 1: append this chunk to every active scan and check for completion ──
+        // search_from tracks where we left off so we only scan newly-appended bytes
+        // (plus a small overlap for markers that straddle a region boundary).
+        const END_MARKER: &[u8] = b"\"DeathSquadable\":";
+        scans.retain_mut(|scan| {
+            // Advance the search cursor before appending so the overlap catches split markers.
+            let search_from = scan.search_from;
+            scan.search_from = scan.data.len().saturating_sub(END_MARKER.len() - 1);
+            scan.data.extend_from_slice(chunk);
+            if scan.data.len() > MAX_SCAN {
+                eprintln!("[blob] scan#{} exceeded {} MB without end — dropped", scan.id, MAX_SCAN / 1024 / 1024);
+                return false; // drop oversized scan
             }
+            // Only search the newly-added window, not the full buffer.
+            let has_end = scan.data[search_from..]
+                .windows(END_MARKER.len())
+                .any(|w| w == END_MARKER);
+            if has_end && find_blob_end(&scan.data).is_some() {
+                match parse_full_account_blob(&scan.data) {
+                    Some(inv) => {
+                        eprintln!("[blob] scan#{} SUCCESS at 0x{:012x}: {} unique, {} stackable, {} mods",
+                            scan.id, region_addr, inv.unique_items.len(), inv.stackable_items.len(), inv.mods.len());
+                        // Cache the START region (not this region) so the fast path works next cycle.
+                        LAST_BLOB_REGION.store(scan.start_region_addr as u64, std::sync::atomic::Ordering::Relaxed);
+                        if save {
+                            let name = format!("Actual_inventory_FULL_ACCOUNT_{}_{:02}.txt", ts, saved + 1);
+                            let path = blob_dir.join(&name);
+                            let text: Vec<u8> = scan.data.iter()
+                                .map(|&b| if b >= 0x20 && b <= 0x7e || b == b'\n' || b == b'\t' { b } else { b'.' })
+                                .collect();
+                            if std::fs::write(&path, &text).is_ok() { saved += 1; }
+                        }
+                        blob_tx.send(inv).ok();
+                        found_result = true;
+                    }
+                    None => {
+                        eprintln!("[blob] scan#{} end marker found but JSON parse failed — dropped", scan.id);
+                    }
+                }
+                false // remove completed (or failed) scan
+            } else {
+                true // keep waiting for end
+            }
+        });
 
-            // Trim: delete everything before "SubscribedToEmails" and after "DeathSquadable":false}
-            const CLEAN_START: &[u8] = b"\"SubscribedToEmails\"";
-            let start = stitched.windows(CLEAN_START.len())
-                .position(|w| w == CLEAN_START)
+        // ── Step 2: check if this chunk opens a new scan ──
+        // Don't open new scans once we already have a result — drain the active ones then exit.
+        if found_result { continue; }
+
+        // Require START_MARKER, no mission-delta flag, and a /Lotus/ path.
+        // Short-circuit: only pay for the anchor/lotus/mission checks when has_start is true.
+        let t2 = std::time::Instant::now();
+        let has_start = chunk.windows(START_MARKER.len()).any(|w| w == START_MARKER);
+        let qualifies = has_start && {
+            let is_mission = chunk.windows(MISSION_DELTA.len()).any(|w| w == MISSION_DELTA);
+            let has_anchor = ANCHORS.iter().any(|a| chunk.windows(a.len()).any(|w| w == *a));
+            let has_lotus  = chunk.windows(LOTUS_KEY.len()).any(|w| w == LOTUS_KEY);
+            !is_mission && (has_anchor || has_lotus)
+        };
+        t_search += t2.elapsed();
+
+        if qualifies {
+            // Seed from the JSON opening { — field order varies by account so
+            // "SubscribedToEmails" may not be the first field (e.g. relics in
+            // MiscItems appear before it for some players).
+            let start_off = chunk.windows(START_MARKER.len())
+                .position(|w| w == START_MARKER)
                 .unwrap_or(0);
-            let end = stitched.windows(END_MARKER.len())
-                .position(|w| w == END_MARKER)
-                .map(|p| p + END_MARKER.len())
-                .unwrap_or(stitched.len());
-            save_data = stitched[start..end].to_vec();
-        } else {
-            // Not a FULL_ACCOUNT blob — skip entirely. We only care about the
-            // authoritative full inventory, not mission deltas or partial blobs.
-            continue;
-        }
+            let json_open = chunk[..start_off + 1]
+                .windows(2)
+                .position(|w| w == b"{\"")
+                .unwrap_or(start_off);
+            let id = next_scan_id;
+            next_scan_id += 1;
+            starts_found += 1;
+            eprintln!("[blob] scan#{} started at 0x{:012x}+{} (json_open={})", id, region_addr, start_off, json_open);
+            let seed = chunk[json_open..].to_vec();
 
-        // Parse the FULL_ACCOUNT blob and send to the monitor thread.
-        match parse_full_account_blob(&save_data) {
-            Some(inv) => {
-                eprintln!("[blob] parsed FULL_ACCOUNT: {} unique, {} stackable, {} mods, {} flavour",
-                    inv.unique_items.len(), inv.stackable_items.len(),
-                    inv.mods.len(), inv.flavour_items.len());
-                blob_tx.send(inv).ok();
-            }
-            None => {
-                eprintln!("[blob] FULL_ACCOUNT parse failed — JSON malformed or start marker missing");
-            }
-        }
-
-        if save {
-            // Blob logging enabled: keep a human-readable copy for debugging.
-            let name = format!("Actual_inventory_FULL_ACCOUNT_{}.txt", ts);
-            let path = {
-                let candidate = blob_dir.join(&name);
-                if candidate.exists() {
-                    blob_dir.join(format!("Actual_inventory_FULL_ACCOUNT_{}_{:02}.txt", ts, saved + 1))
-                } else { candidate }
-            };
-            let text: Vec<u8> = save_data.iter()
-                .map(|&b| if b >= 0x20 && b <= 0x7e || b == b'\n' || b == b'\t' { b } else { b'.' })
-                .collect();
-            if std::fs::write(&path, &text).is_ok() {
-                saved += 1;
+            // Check immediately: does this single chunk already contain the full blob?
+            if find_blob_end(&seed).is_some() {
+                match parse_full_account_blob(&seed) {
+                    Some(inv) => {
+                        eprintln!("[blob] scan#{} immediate SUCCESS at 0x{:012x}: {} unique, {} stackable",
+                            id, region_addr, inv.unique_items.len(), inv.stackable_items.len());
+                        // region_addr IS the start region here (single-chunk blob).
+                        LAST_BLOB_REGION.store(region_addr as u64, std::sync::atomic::Ordering::Relaxed);
+                        if save {
+                            let name = format!("Actual_inventory_FULL_ACCOUNT_{}_{:02}.txt", ts, saved + 1);
+                            if std::fs::write(blob_dir.join(&name), &seed).is_ok() { saved += 1; }
+                        }
+                        blob_tx.send(inv).ok();
+                        found_result = true;
+                    }
+                    None => {
+                        eprintln!("[blob] scan#{} immediate end found but parse failed — dropping", id);
+                    }
+                }
+            } else {
+                scans.push(ActiveScan { data: seed, id, start_region_addr: region_addr, search_from: 0 });
             }
         }
     }
 
-    eprintln!("[blob-capture] done: regions_scanned={} anchor_hits={} blobs_saved={}", regions_scanned, anchor_hits, saved);
-    if anchor_hits == 0 {
-        eprintln!("[blob-capture] WARNING: no start-marker region found — FULL_ACCOUNT blob not in memory (game in mission or on login screen?)");
+    eprintln!(
+        "[blob-capture] done: read={} skipped={} starts={} saved={} bytes={}MB | \
+         vquery={:.0}ms read={:.0}ms search={:.0}ms",
+        regions_read, regions_skipped, starts_found, saved, bytes_read / 1_000_000,
+        t_vquery.as_secs_f64() * 1000.0,
+        t_read.as_secs_f64()   * 1000.0,
+        t_search.as_secs_f64() * 1000.0,
+    );
+    if starts_found == 0 {
+        eprintln!("[blob-capture] WARNING: no start-marker found — FULL_ACCOUNT not in memory \
+            (game in mission, on login screen, or Arsenal not open?)");
     }
     unsafe { CloseHandle(process); }
     saved

@@ -1,4 +1,4 @@
-# FrameForge — Warframe Companion `v2.1.0`
+# FrameForge — Warframe Companion `v2.2.0`
 
 A desktop companion for Warframe — live inventory, market prices, trading, timers, relic overlay, and riven analysis. Read-only, no game modification.
 
@@ -18,6 +18,11 @@ Browse every craftable item with full ingredient trees. Components are colour-co
 
 ### Market Helper
 Browse Prime sets with live platinum prices from [warframe.market](https://warframe.market). Click any item for a live order popup with sell/buy orders, 3-week price chart, and one-click listing (requires WFM login).
+
+**WFM Status Automation** (requires WFM login):
+- Go Invisible on startup — set your status to Invisible the moment FrameForge opens
+- Go Invisible on close — set your status before the app exits (X button or taskbar close)
+- Auto-invisible timer — automatically go Invisible after a configurable number of minutes
 
 ### Trading
 Full warframe.market integration — manage active listings, post new orders, and receive trade whispers from in-game chat.
@@ -51,6 +56,9 @@ When a void fissure reward screen opens, FrameForge automatically captures it vi
 
 ### Modular Window
 Customisable sidebar with reorderable sections: tracked crafting items, favourite inventory items, pinned timers, and watched fissures.
+
+### Settings
+Reorganised into a tabbed sidebar layout: **General** (overlay, scanner, API, account login, pop-out), **Market** (WFM status automation), **Accessibility** (colorblind mode, text size), **Data** (item database, cache), and **Debugging** (loggers, diagnostic tools with folder access and one-click clear).
 
 ---
 
