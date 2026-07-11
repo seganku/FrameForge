@@ -1,5 +1,6 @@
-import { useState, useEffect, useMemo, useCallback, memo } from "react";
+import { useState, useEffect, useMemo, useCallback, memo, startTransition, useRef, useContext } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { ImgCacheDirContext } from "./ImgCacheDir";
 import { HelpTip } from "./HelpTip";
 import type { InventoryItem } from "./App";
 import sentientIcon from "./assets/SentientFactionIcon.webp";
@@ -193,13 +194,20 @@ function ownsRelicVariant(relicUnique: string, inventory: Record<string, Invento
 // ─── Item image ───────────────────────────────────────────────────────────────
 
 function ItemImg({ imageName, category, size = 40 }: { imageName?: string; category: string; size?: number }) {
-  const [failed, setFailed] = useState(false);
+  const baseUrl = useContext(ImgCacheDirContext);
+  const [localFailed, setLocalFailed] = useState(false);
+  const [cdnFailed,   setCdnFailed]   = useState(false);
   const style = { width: size, height: size, flexShrink: 0 };
-  if (!imageName || failed)
+  if (!imageName || cdnFailed)
     return <span className="item-img-fallback" style={{ ...style, fontSize: size * 0.35 }}>{category[0].toUpperCase()}</span>;
+  const useLocal = Boolean(baseUrl) && !localFailed;
+  const src = useLocal
+    ? `${baseUrl}/${imageName}`
+    : `https://cdn.warframestat.us/img/${imageName}`;
   return (
-    <img className="item-img" style={style} src={`https://cdn.warframestat.us/img/${imageName}`}
-      alt="" loading="lazy" onError={() => setFailed(true)} />
+    <img className="item-img" style={style} src={src}
+      alt="" loading="lazy"
+      onError={() => useLocal ? setLocalFailed(true) : setCdnFailed(true)} />
   );
 }
 
@@ -440,6 +448,32 @@ const CraftCard = memo(function CraftCard({ item, recipe, inventory, relicDrops,
       </div>
     </div>
   );
+}, (prev, next) => {
+  // Only re-render when props that affect this card's display actually change.
+  // Avoids re-rendering all cards on every 10-second inventory scan.
+  if (prev.item          !== next.item)          return false;
+  if (prev.recipe        !== next.recipe)        return false;
+  if (prev.isTracked     !== next.isTracked)     return false;
+  if (prev.crafting      !== next.crafting)      return false;
+  if (prev.onTrack       !== next.onTrack)       return false;
+  if (prev.onOpen        !== next.onOpen)        return false;
+  if (prev.relicDrops    !== next.relicDrops)    return false;
+  if (prev.relicNames    !== next.relicNames)    return false;
+  if (prev.subsummedWarframes !== next.subsummedWarframes) return false;
+  // Inventory: only check keys this specific card reads
+  const keys = new Set<string>([prev.item.unique_name]);
+  for (const c of (prev.recipe ?? [])) {
+    keys.add(c.unique_name);
+    if (c.components[0]) keys.add(c.components[0].unique_name);
+  }
+  for (const k of keys) {
+    if ((prev.inventory[k]?.quantity    ?? 0)    !== (next.inventory[k]?.quantity    ?? 0))    return false;
+    if ((prev.inventory[k]?.mastery_rank ?? null) !== (next.inventory[k]?.mastery_rank ?? null)) return false;
+  }
+  const pShards = prev.inventory[prev.item.unique_name]?.archon_shards;
+  const nShards = next.inventory[next.item.unique_name]?.archon_shards;
+  if ((pShards?.length ?? 0) !== (nShards?.length ?? 0)) return false;
+  return true;
 });
 
 // ─── Foundry ─────────────────────────────────────────────────────────────────
@@ -455,6 +489,29 @@ export default function Foundry({ inventory, refreshKey, crafting, subsummedWarf
   const [relicDrops, setRelicDrops] = useState<Record<string, string[]>>({});
   const [relicNames, setRelicNames] = useState<Record<string, string>>({});
   const [modalItem, setModalItem] = useState<CatalogItem | null>(null);
+  const [inputSearch, setInputSearch] = useState(filters.search);
+  const [page, setPage] = useState(0);
+
+  // Refs so debounce closure always reads latest values without stale captures
+  const filtersRef = useRef(filters);
+  filtersRef.current = filters;
+  const onFiltersChangeRef = useRef(onFiltersChange);
+  onFiltersChangeRef.current = onFiltersChange;
+
+  const trackedSet = useMemo(() => new Set(tracked), [tracked]);
+
+  // Sync local input when parent resets search (e.g. "Show All" button)
+  useEffect(() => { setInputSearch(filters.search); }, [filters.search]); // eslint-disable-line
+
+  // Wait 150 ms after last keystroke before propagating to parent filters
+  useEffect(() => {
+    if (inputSearch === filtersRef.current.search) return;
+    const id = setTimeout(() => {
+      const f = filtersRef.current;
+      onFiltersChangeRef.current({ ...f, search: inputSearch, ...(inputSearch ? { activeCat: "All" as any } : {}) });
+    }, 150);
+    return () => clearTimeout(id);
+  }, [inputSearch]); // eslint-disable-line
 
   const { search, activeCat, filterPrime, filterVaulted, filterUnvaulted, filterMastered, filterUnmastered, filterOwned, filterUnowned, filterReady } = filters;
   const set = <K extends keyof FoundryFilters>(k: K, v: FoundryFilters[K]) => onFiltersChange({ ...filters, [k]: v });
@@ -504,6 +561,12 @@ export default function Foundry({ inventory, refreshKey, crafting, subsummedWarf
       filterReady ? recipes : null,
   ]);
 
+  // Reset to first page whenever the visible list changes
+  useEffect(() => { setPage(0); }, [visible]);
+  const PAGE_SIZE = 30;
+  const pageCount = Math.ceil(visible.length / PAGE_SIZE);
+  const pagedItems = useMemo(() => visible.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE), [visible, page]);
+
   // Load recipes for visible items — one bulk IPC call instead of N concurrent calls
   useEffect(() => {
     const toLoad = visible.filter(i => !recipes.has(i.unique_name));
@@ -513,12 +576,14 @@ export default function Foundry({ inventory, refreshKey, crafting, subsummedWarf
       uniqueNames: toLoad.map(i => i.unique_name),
     }).then(result => {
       if (cancelled) return;
-      setRecipes(prev => {
-        const next = new Map(prev);
-        for (const item of toLoad) {
-          next.set(item.unique_name, result[item.unique_name] ?? []);
-        }
-        return next;
+      startTransition(() => {
+        setRecipes(prev => {
+          const next = new Map(prev);
+          for (const item of toLoad) {
+            next.set(item.unique_name, result[item.unique_name] ?? []);
+          }
+          return next;
+        });
       });
     }).catch(() => {});
     return () => { cancelled = true; };
@@ -575,11 +640,8 @@ export default function Foundry({ inventory, refreshKey, crafting, subsummedWarf
       {/* ── Col 1: Category sidebar ── */}
       <div className="foundry-sidebar">
         <div className="foundry-search-wrap">
-          <input className="foundry-search" placeholder="Search…" value={search}
-            onChange={e => {
-              const v = e.target.value;
-              onFiltersChange({ ...filters, search: v, ...(v ? { activeCat: "All" as any } : {}) });
-            }} />
+          <input className="foundry-search" placeholder="Search…" value={inputSearch}
+            onChange={e => setInputSearch(e.target.value)} />
         </div>
         {CRAFT_CATEGORIES.map(cat => (
           <button key={cat} className={`cat-btn ${activeCat === cat ? "cat-active" : ""}`}
@@ -624,7 +686,7 @@ export default function Foundry({ inventory, refreshKey, crafting, subsummedWarf
               {craftable.length === 0 ? "No recipes loaded — refresh item list first." : "No items match."}
             </div>
           )}
-          {visible.map(item => (
+          {pagedItems.map(item => (
             <CraftCard
               key={item.unique_name}
               item={item}
@@ -633,13 +695,20 @@ export default function Foundry({ inventory, refreshKey, crafting, subsummedWarf
               relicDrops={relicDrops}
               relicNames={relicNames}
               crafting={crafting}
-              isTracked={tracked.includes(item.unique_name)}
+              isTracked={trackedSet.has(item.unique_name)}
               onTrack={handleTrack}
               onOpen={handleOpen}
               subsummedWarframes={subsummedWarframes}
             />
           ))}
         </div>
+        {pageCount > 1 && (
+          <div className="foundry-pagination">
+            <button className="btn-secondary" disabled={page === 0} onClick={() => setPage(p => p - 1)}>← Prev</button>
+            <span className="foundry-pg-label">Page {page + 1} of {pageCount}</span>
+            <button className="btn-secondary" disabled={page >= pageCount - 1} onClick={() => setPage(p => p + 1)}>Next →</button>
+          </div>
+        )}
       </div>
 
     </div>

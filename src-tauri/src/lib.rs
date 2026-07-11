@@ -13,6 +13,7 @@ fn atomic_write(path: &PathBuf, data: &[u8]) -> std::io::Result<()> {
 }
 use tauri::{Emitter, Manager, State};
 
+mod console_login; // [console-login feature] remove this line to drop the feature
 mod db;
 mod memory_scanner;
 mod ocr;
@@ -91,6 +92,13 @@ pub struct AppState {
     /// Most recent OCR frame (top ~48% of Warframe window, BGRA, width, height).
     /// Stored by the OCR loop so auto-capture can write it without a second GPU readback.
     pub last_ocr_frame: Arc<Mutex<Option<(Vec<u8>, u32, u32)>>>,
+    /// Local image cache directory — craftable item images downloaded here on first run.
+    pub img_cache_dir: PathBuf,
+    /// Port of the local HTTP image server (set in setup hook, 0 until started).
+    pub img_server_port: Mutex<u16>,
+    /// Local Warframe account name extracted from EE.log "Logged in NAME".
+    /// Used to filter the player's own name from OCR captures and to display in the UI.
+    pub local_player_name: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -1670,10 +1678,39 @@ async fn wfm_set_status(state: State<'_, AppState>, status: String) -> Result<()
     let status_for_ws = status.clone();
 
     tokio::task::spawn_blocking(move || -> Result<(), String> {
-        use tungstenite::{connect, Message};
+        use tungstenite::{Message, stream::MaybeTlsStream, client::IntoClientRequest};
+        use std::{net::TcpStream, time::Duration};
 
-        let (mut ws, _) = connect("wss://ws.warframe.market/socket")
+        const HOST: &str = "ws.warframe.market:443";
+        const RW_TIMEOUT: Duration = Duration::from_secs(5);
+
+        // Resolve + connect with an explicit timeout so a slow/unresponsive
+        // WFM server can't block this thread for the OS default (~20 s).
+        let addr = HOST.parse::<std::net::SocketAddr>()
+            .or_else(|_| {
+                use std::net::ToSocketAddrs;
+                HOST.to_socket_addrs()?.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no addr"))
+            })
+            .map_err(|e| format!("DNS: {}", e))?;
+        let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+            .map_err(|e| format!("TCP connect: {}", e))?;
+        tcp.set_read_timeout(Some(RW_TIMEOUT)).ok();
+        tcp.set_write_timeout(Some(RW_TIMEOUT)).ok();
+
+        let req = "wss://ws.warframe.market/socket".into_client_request()
+            .map_err(|e| format!("WS request: {}", e))?;
+        let (mut ws, _) = tungstenite::client_tls(req, tcp)
             .map_err(|e| format!("WS connect: {}", e))?;
+
+        // Read timeout is already set on the stream; also applies post-TLS
+        // because native-tls forwards read/write to the underlying TcpStream.
+        // Belt-and-suspenders: confirm via get_ref in case the TLS wrapper
+        // resets it.
+        match ws.get_ref() {
+            MaybeTlsStream::Plain(s)     => { let _ = s.set_read_timeout(Some(RW_TIMEOUT)); }
+            MaybeTlsStream::NativeTls(s) => { let _ = s.get_ref().set_read_timeout(Some(RW_TIMEOUT)); }
+            _ => {}
+        }
 
         let send = |ws: &mut tungstenite::WebSocket<_>, route: &str, payload: serde_json::Value| {
             let msg = serde_json::json!({ "route": route, "payload": payload, "id": route }).to_string();
@@ -3629,6 +3666,13 @@ fn set_app_version(version: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Hard-exit the process. Called from the frontend close handler when destroy()
+/// is unreliable (e.g. after a Promise.race timeout on a hanging WFM API call).
+#[tauri::command]
+fn force_quit() {
+    std::process::exit(0);
+}
+
 #[tauri::command]
 fn load_settings(state: State<AppState>) -> String {
     std::fs::read_to_string(&state.settings_path).unwrap_or_default()
@@ -3815,6 +3859,8 @@ pub struct InventoryUpdate {
     /// True only on the end-of-full-pass emit. Frontend should REPLACE archonShards
     /// state instead of merging so stale entries are cleaned up.
     pub is_full_pass: bool,
+    /// Local Warframe account name ("Logged in NAME" from EE.log). None until detected.
+    pub player_name: Option<String>,
 }
 
 #[tauri::command]
@@ -4004,6 +4050,8 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                 warframe_running: game_found,
                 scanned_at: now_pre,
                 is_full_pass: true,
+                player_name: app.state::<AppState>().local_player_name
+                    .lock().ok().and_then(|g| g.clone()),
             });
         }
 
@@ -4026,6 +4074,10 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
         // instead of on every 2-second loop tick (CreateToolhelp32Snapshot is not free).
         let mut last_pid_check: Option<std::time::Instant> = None;
         let mut cached_game_running = false;
+        // When game is not running, suppress redundant inventory-update emits.
+        // Only emit on the status-change tick and then at most once every 30 s as a heartbeat.
+        let mut prev_game_running = false;
+        let mut last_not_running_emit: Option<std::time::Instant> = None;
 
         while flag.load(Ordering::SeqCst) {
             // If shared_quantities was cleared externally (clear_cache command), wipe local
@@ -4190,6 +4242,8 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                     mods:             known_mods.clone(),
                     socketed_shards:  current_socketed_shards.clone(),
                     is_full_pass:     true,
+                    player_name: app.state::<AppState>().local_player_name
+                        .lock().ok().and_then(|g| g.clone()),
                 });
 
                 let detail = format!(
@@ -4250,28 +4304,43 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                         eprintln!("[monitor] blob capture finished (files_saved={} save_flag={} ts={})", count, save, ts);
                     });
                 }
+                prev_game_running = true;
             } else {
-                // Game not running — emit current cached state
-                let mut emit_qty = known.clone();
-                for k in &confirmed_unique { emit_qty.entry(k.clone()).or_insert(1); }
-                for (p, mc) in &known_mods { emit_qty.entry(p.clone()).or_insert(mc.total); }
-                let crafting: Vec<CraftingJob> = current_recipes.iter().map(|r| {
-                    let name = display_names.iter().zip(unique_names.iter())
-                        .find(|(_, u)| *u == &r.unique_name)
-                        .map(|(d, _)| d.clone())
-                        .unwrap_or_else(|| r.unique_name.split('/').last().unwrap_or("?").to_string());
-                    CraftingJob { unique_name: r.unique_name.clone(), item_name: name, completion_ms: r.completion_ms }
-                }).collect();
-                let _ = app.emit("inventory-update", InventoryUpdate {
-                    quantities: emit_qty, crafting,
-                    mastery_rank: current_mastery_rank,
-                    mastery_data: current_mastery_data.clone(),
-                    changes: vec![], warframe_running: false, scanned_at: now,
-                    consumed_suits: current_consumed_suits.clone(),
-                    mods: known_mods.clone(),
-                    socketed_shards: current_socketed_shards.clone(),
-                    is_full_pass: false,
-                });
+                // Game not running — throttle emits: only on status-change and every 30 s heartbeat.
+                // Without this guard the loop emits every 2 s with identical data, triggering a
+                // full React render cascade (17 k-item useMemo rebuild) 30 times per minute.
+                let status_changed = prev_game_running;
+                let heartbeat_due  = last_not_running_emit
+                    .map_or(true, |t: std::time::Instant| t.elapsed() >= std::time::Duration::from_secs(30));
+                if status_changed || heartbeat_due {
+                    let mut emit_qty = known.clone();
+                    for k in &confirmed_unique { emit_qty.entry(k.clone()).or_insert(1); }
+                    for (p, mc) in &known_mods { emit_qty.entry(p.clone()).or_insert(mc.total); }
+                    let crafting: Vec<CraftingJob> = current_recipes.iter().map(|r| {
+                        let name = display_names.iter().zip(unique_names.iter())
+                            .find(|(_, u)| *u == &r.unique_name)
+                            .map(|(d, _)| d.clone())
+                            .unwrap_or_else(|| r.unique_name.split('/').last().unwrap_or("?").to_string());
+                        CraftingJob { unique_name: r.unique_name.clone(), item_name: name, completion_ms: r.completion_ms }
+                    }).collect();
+                    // Skip mastery_data on heartbeats — it hasn't changed and spreading 17k
+                    // entries into React state on every tick is expensive.
+                    let send_mastery = status_changed;
+                    let _ = app.emit("inventory-update", InventoryUpdate {
+                        quantities: emit_qty, crafting,
+                        mastery_rank: current_mastery_rank,
+                        mastery_data: if send_mastery { current_mastery_data.clone() } else { HashMap::new() },
+                        changes: vec![], warframe_running: false, scanned_at: now,
+                        consumed_suits: current_consumed_suits.clone(),
+                        mods: known_mods.clone(),
+                        socketed_shards: current_socketed_shards.clone(),
+                        is_full_pass: false,
+                        player_name: app.state::<AppState>().local_player_name
+                            .lock().ok().and_then(|g| g.clone()),
+                    });
+                    last_not_running_emit = Some(std::time::Instant::now());
+                }
+                prev_game_running = false;
             }
 
             std::thread::sleep(std::time::Duration::from_secs(2));
@@ -4466,6 +4535,52 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
             let mut active_since: Option<std::time::Instant> = None;
             use std::io::{Read, Seek, SeekFrom};
 
+            // ── Startup scan: seed player names from the existing log ─────────
+            // The tail starts at file-end so lines written before FrameForge launched
+            // are invisible to it. Two bounded reads cover both cases:
+            //  • First 64 KB  → "Logged in NAME" is always within the first ~100 lines.
+            //  • Last 1 MB    → AddSquadMember fires during mission load-in (recent).
+            // Bounded reads avoid stalling on a log file that has grown to hundreds of MB.
+            {
+                use std::io::{Read, Seek, SeekFrom};
+
+                // Read the last 1 MB of EE.log. This covers both cases:
+                //   • EE.log resets on game launch → whole file fits in 1 MB.
+                //   • EE.log accumulates → current session's "Logged in" is near the end.
+                // Searching only the first 64 KB misses the current session when the log
+                // has grown large from previous runs.
+                if let Ok(mut f) = std::fs::File::open(&log_path) {
+                    let file_len = f.seek(SeekFrom::End(0)).unwrap_or(0);
+                    let read_from = file_len.saturating_sub(1_048_576); // last 1 MB
+                    let _ = f.seek(SeekFrom::Start(read_from));
+                    let mut buf = Vec::with_capacity(1_048_576);
+                    let _ = f.read_to_end(&mut buf);
+                    // Skip first (potentially partial) line when starting mid-file.
+                    let start = if read_from > 0 { buf.iter().position(|&b| b == b'\n').map_or(0, |i| i + 1) } else { 0 };
+                    if let Ok(text) = std::str::from_utf8(&buf[start..]) {
+                        // ── Local player name (most recent "Logged in NAME") ──────────
+                        parse_logged_in_name(text, &shared_squad_names2, &ee_ocr_app);
+
+                        // ── Squad mate names ──────────────────────────────────────────
+                        for line in text.lines() {
+                            if line.contains("AddSquadMember: ") {
+                                if let Some(after) = line.find("AddSquadMember: ").map(|i| &line[i + 16..]) {
+                                    if let Some(name) = after.split(',').next().map(str::trim) {
+                                        if !name.is_empty() {
+                                            if let Ok(mut g) = shared_squad_names2.lock() {
+                                                if !g.iter().any(|n: &String| n == name) {
+                                                    g.push(name.to_string());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // ── VoidProjections reward sequence state ─────────────────────────
             // The game logs squad reward info BEFORE the screen trigger fires.
             // We accumulate it across poll iterations so it's ready when OCR starts.
@@ -4576,9 +4691,9 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
 
                 // ── Squad member name collection ─────────────────────────────────
                 // "AddSquadMember: NAME, mm=..." fires when each squadmate loads in.
-                // Accumulate for the lifetime of the app — stale names from earlier
-                // sessions are harmless because a player's name only appears in the
-                // OCR capture when they are actually in the current squad.
+                // "Logged in NAME" fires when the local player signs in — their name
+                // never appears in AddSquadMember (that's only for squad mates).
+                // Both sets feed the OCR filter so usernames don't fuzzy-match items.
                 for line in buf.lines() {
                     if line.contains("AddSquadMember: ") {
                         if let Some(after) = line.find("AddSquadMember: ").map(|i| &line[i + 16..]) {
@@ -4592,6 +4707,9 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                                 }
                             }
                         }
+                    }
+                    if line.contains("Logged in ") {
+                        parse_logged_in_name(line, &shared_squad_names2, &ee_ocr_app);
                     }
                 }
 
@@ -4897,16 +5015,28 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
                     let ts0 = chrono::Local::now().format("%H:%M:%S%.3f");
 
                     // Start a fresh session log for this reward screen
+                    let known_names_str = {
+                        let names = shared_squad_names.lock()
+                            .map(|g| g.clone()).unwrap_or_default();
+                        if names.is_empty() {
+                            "  (none — names not yet seen in EE.log)".to_string()
+                        } else {
+                            names.iter().map(|n| format!("  • {}", n)).collect::<Vec<_>>().join("\n")
+                        }
+                    };
                     let write_err = std::fs::write(&session_log_path, format!(
                         "══════════════════════════════════════════════\n\
                          RELIC OVERLAY SESSION — {}\n\
                          ══════════════════════════════════════════════\n\
                          Log path  : {}\n\n\
+                         [KNOWN PLAYERS — OCR username filter]\n\
+                         {}\n\n\
                          [STEP 1] EE.log TRIGGER\n\
                          ├─ Time     : {}\n\
                          ├─ Line     : \"{}\"\n\
                          └─ Catalog  : {} items\n\n",
-                        ts0, session_log_path.display(), ts0, trigger_line, ee_catalog.len()
+                        ts0, session_log_path.display(), known_names_str,
+                        ts0, trigger_line, ee_catalog.len()
                     ));
                     if let Err(e) = write_err {
                         eprintln!("[FrameForge] session log write failed: {e}");
@@ -5376,7 +5506,38 @@ async fn start_monitor(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
     Ok(())
 }
 
-/// Append a string to a file, creating the file if it doesn't exist.
+/// Extract the local player name from EE.log lines containing "Logged in NAME".
+/// Adds the name to shared_squad_names (for OCR filtering) and AppState.local_player_name
+/// (for UI display). Safe to call with a single line or the full log contents.
+fn parse_logged_in_name(
+    text: &str,
+    squad_names: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    app: &tauri::AppHandle,
+) {
+    // Target: "Sys [Info]: Logged in Sikewyrm"
+    // The account-login line has exactly ONE token after "Logged in" and nothing more.
+    // Lines like "Logged in to region server" have multiple tokens — skip them.
+    // Match "]: Logged in " so we don't trigger on unrelated "Logged in …" phrases.
+    const MARKER: &str = "]: Logged in ";
+    for line in text.lines().rev() {
+        let Some(pos) = line.find(MARKER) else { continue };
+        let after = line[pos + MARKER.len()..].trim();
+        let name: String = after.chars().take_while(|c| !c.is_whitespace()).collect();
+        // Skip if anything follows the name — that means it's "Logged in to X", not an account.
+        let remainder = after[name.len()..].trim();
+        if name.len() < 3 || !remainder.is_empty() { continue; }
+        if let Ok(mut g) = squad_names.lock() {
+            if !g.iter().any(|n: &String| n == &name) { g.push(name.clone()); }
+        }
+        if let Ok(mut n) = app.state::<AppState>().local_player_name.lock() {
+            *n = Some(name.clone());
+        }
+        // Emit immediately so the header updates without waiting for the next scan tick.
+        let _ = app.emit("player-name", &name);
+        return;
+    }
+}
+
 fn append_to_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
@@ -6280,8 +6441,107 @@ fn clear_diag_folder() -> u64 {
     0
 }
 
-/// Open a debug folder in Windows Explorer.
-/// `which`: "blobs" | "api_logs" | "raw_scan" | "probe" | "diag"
+/// Minimal HTTP file server for the local image cache.
+/// Accepts GET /{filename} and serves files from `cache_dir`.
+async fn serve_image_files(listener: tokio::net::TcpListener, cache_dir: PathBuf) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let cache_dir = Arc::new(cache_dir);
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else { continue };
+        let dir = Arc::clone(&cache_dir);
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 512];
+            let n = match stream.read(&mut buf).await {
+                Ok(n) if n > 0 => n,
+                _ => return,
+            };
+            let req = std::str::from_utf8(&buf[..n]).unwrap_or("");
+            let filename = match req.lines().next()
+                .and_then(|l| l.strip_prefix("GET /"))
+                .and_then(|l| l.split_whitespace().next())
+            {
+                Some(f) if !f.is_empty() && !f.contains("..") && !f.contains('/') && !f.contains('\\') => f,
+                _ => {
+                    let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n").await;
+                    return;
+                }
+            };
+            match tokio::fs::read(dir.join(filename)).await {
+                Ok(data) => {
+                    let mime = if filename.ends_with(".png") { "image/png" }
+                        else if filename.ends_with(".jpg") || filename.ends_with(".jpeg") { "image/jpeg" }
+                        else if filename.ends_with(".webp") { "image/webp" }
+                        else { "application/octet-stream" };
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: public, max-age=86400\r\n\r\n",
+                        mime, data.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(&data).await;
+                }
+                Err(_) => {
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await;
+                }
+            }
+        });
+    }
+}
+
+/// Returns the base URL of the local image server, e.g. "http://127.0.0.1:51234".
+/// Frontend uses this as `${baseUrl}/${imageName}` to load cached images from disk.
+#[tauri::command]
+fn get_img_cache_dir(state: State<AppState>) -> String {
+    let port = *state.img_server_port.lock().unwrap();
+    format!("http://127.0.0.1:{}", port)
+}
+
+/// Download images for all craftable items that aren't already cached to disk.
+/// Returns immediately — downloads happen on background threads (8 in parallel).
+/// Safe to call every startup; already-cached files are skipped via existence check.
+#[tauri::command]
+async fn prewarm_image_cache(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    let items: Vec<_> = state.wfcd_items.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let recipe_names: HashSet<String> = state.recipes.lock()
+        .unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
+    let cache_dir = Arc::new(state.img_cache_dir.clone());
+
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let names: Vec<String> = items.iter()
+            .filter(|i| recipe_names.contains(&i.unique_name))
+            .filter_map(|i| i.image_name.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .filter(|n| !cache_dir.join(n).exists())
+            .collect();
+
+        if names.is_empty() { return; }
+        eprintln!("[img_cache] Prewarming {} images in background", names.len());
+
+        for chunk in names.chunks(8) {
+            let handles: Vec<_> = chunk.iter().map(|name| {
+                let dir = Arc::clone(&cache_dir);
+                let name = name.clone();
+                std::thread::spawn(move || {
+                    let url = format!("https://cdn.warframestat.us/img/{}", name);
+                    if let Ok(resp) = ureq::get(&url).call() {
+                        let mut buf = Vec::new();
+                        if resp.into_reader().read_to_end(&mut buf).is_ok() {
+                            let _ = std::fs::write(dir.join(&name), buf);
+                        }
+                    }
+                })
+            }).collect();
+            for h in handles { let _ = h.join(); }
+        }
+        eprintln!("[img_cache] Prewarm complete");
+    }); // intentionally not awaited — fire and forget
+
+    Ok(())
+}
+
 #[tauri::command]
 fn open_debug_folder(state: State<AppState>, which: String) -> Result<(), String> {
     let path: std::path::PathBuf = match which.as_str() {
@@ -6899,6 +7159,8 @@ pub fn run() {
     let _ = std::fs::create_dir_all(&api_log_dir);
     let wfm_top_cache_path = data_dir.join("wfm_top_cache.json");
     let syndicate_catalog_path = data_dir.join("syndicate_catalog.json");
+    let img_cache_dir = data_dir.join("img_cache");
+    let _ = std::fs::create_dir_all(&img_cache_dir);
     let auction_ids_path = data_dir.join("auction_ids.json");
     let initial_auction_ids: Vec<String> = std::fs::read_to_string(&auction_ids_path)
         .ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
@@ -6960,6 +7222,7 @@ pub fn run() {
         .ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
 
     tauri::Builder::default()
+        .register_uri_scheme_protocol("ffauth", |ctx, req| console_login::handle_ffauth(ctx.app_handle(), &req)) // [console-login feature]
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
             db_path,
@@ -7004,9 +7267,31 @@ pub fn run() {
             syndicate_catalog_path,
             auction_ids: Mutex::new(initial_auction_ids),
             auction_ids_path,
+            img_cache_dir,
+            img_server_port: Mutex::new(0),
+            local_player_name: Arc::new(Mutex::new(None)),
         })
         .setup(|app| {
             use tauri::Manager;
+
+            // Spin up a tiny local HTTP server that serves cached item images from disk.
+            // This is more reliable than convertFileSrc (which needs assetProtocol scope).
+            // Bind the std listener here (sync) to get the port, then convert to tokio
+            // inside the spawned async block where the tokio runtime is active.
+            {
+                let img_cache_dir = app.state::<AppState>().img_cache_dir.clone();
+                let std_listener = std::net::TcpListener::bind("127.0.0.1:0")
+                    .map_err(|e| e.to_string())?;
+                let port = std_listener.local_addr().map_err(|e| e.to_string())?.port();
+                *app.state::<AppState>().img_server_port.lock().unwrap() = port;
+                tauri::async_runtime::spawn(async move {
+                    std_listener.set_nonblocking(true).ok();
+                    if let Ok(tokio_listener) = tokio::net::TcpListener::from_std(std_listener) {
+                        serve_image_files(tokio_listener, img_cache_dir).await;
+                    }
+                });
+            }
+
             if let Some(window) = app.get_webview_window("main") {
                 let icon = tauri::image::Image::from_bytes(
                     include_bytes!("../icons/icon.png")
@@ -7046,6 +7331,7 @@ pub fn run() {
             set_api_log,
             get_app_version,
             set_app_version,
+            force_quit,
             get_craftable_items,
             get_recipe,
             get_recipes_bulk,
@@ -7117,6 +7403,8 @@ pub fn run() {
             clear_diag_folder,
             save_auto_diag_capture,
             capture_diagnostics,
+            get_img_cache_dir,
+            prewarm_image_cache,
             open_debug_folder,
             clear_debug_data,
             get_debug_data_size,
@@ -7125,6 +7413,7 @@ pub fn run() {
             get_monitor_status,
             get_blueprint_names,
             get_current_crafting,
+            console_login::open_console_login, // [console-login feature]
         ])
         .on_window_event(|window, event| {
             let label = window.label().to_string();
@@ -7141,16 +7430,13 @@ pub fn run() {
                         }
                     }
                     tauri::WindowEvent::CloseRequested { .. } => {
-                        // Final save on close (catches maximised state change just before quit)
-                        let app = window.app_handle();
-                        if let Some(wv) = app.get_webview_window(&label) {
-                            let state = app.state::<AppState>();
-                            save_window_state(&wv, &state.settings_path, prefix);
-                        }
+                        // Do NOT call save_window_state here — window position/size methods
+                        // can deadlock when called from within a main-thread event handler.
+                        // State is already saved on every Moved/Resized event.
                     }
                     tauri::WindowEvent::Destroyed => {
                         // Kill the process only when the main window is destroyed
-                        // (prevents orphaned overlay/modular windows)
+                        // (prevents orphaned overlay/modular windows keeping the process alive)
                         if label == "main" {
                             std::process::exit(0);
                         }

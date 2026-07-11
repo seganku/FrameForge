@@ -1053,6 +1053,10 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
         // (plus a small overlap for markers that straddle a region boundary).
         const END_MARKER: &[u8] = b"\"DeathSquadable\":";
         scans.retain_mut(|scan| {
+            // A previous scan in this same retain_mut pass already succeeded.
+            // Drop this one immediately — applying a second blob overwrites correct data
+            // with a stale/parallel copy from a different memory region.
+            if found_result && !save { return false; }
             // Advance the search cursor before appending so the overlap catches split markers.
             let search_from = scan.search_from;
             scan.search_from = scan.data.len().saturating_sub(END_MARKER.len() - 1);

@@ -1,4 +1,4 @@
-# FrameForge — Warframe Companion `v2.2.0`
+# FrameForge — Warframe Companion `v2.3.0`
 
 A desktop companion for Warframe — live inventory, market prices, trading, timers, relic overlay, and riven analysis. Read-only, no game modification.
 
@@ -58,7 +58,7 @@ When a void fissure reward screen opens, FrameForge automatically captures it vi
 Customisable sidebar with reorderable sections: tracked crafting items, favourite inventory items, pinned timers, and watched fissures.
 
 ### Settings
-Reorganised into a tabbed sidebar layout: **General** (overlay, scanner, API, account login, pop-out), **Market** (WFM status automation), **Accessibility** (colorblind mode, text size), **Data** (item database, cache), and **Debugging** (loggers, diagnostic tools with folder access and one-click clear).
+Reorganised into a tabbed sidebar layout: **General** (overlay, scanner, API, account info, pop-out), **Market** (WFM status automation), **Accessibility** (colorblind mode, text size), **Data** (item database, cache), and **Debugging** (loggers, diagnostic tools with folder access and one-click clear).
 
 ---
 

@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useMemo, useCallback, useRef, Component, ReactNode } from "react";
+﻿import { useState, useEffect, useMemo, useCallback, useRef, memo, useContext, Component, ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
@@ -52,6 +52,7 @@ async function ensureRivenWindow(wx: number, wy: number, wh: number): Promise<{ 
 }
 import { getCurrentWindow, availableMonitors } from "@tauri-apps/api/window";
 
+import { ImgCacheDirContext } from "./ImgCacheDir";
 import Foundry from "./Foundry";
 import MarketHelper, { MARKET_FILTERS_DEFAULT } from "./MarketHelper";
 import RelicHelper, { RELIC_FILTERS_DEFAULT } from "./RelicHelper";
@@ -148,6 +149,7 @@ interface InventoryUpdate {
   mods?: Record<string, { total: number; by_rank: Record<string, number> }>;
   socketed_shards?: Record<string, ArchonShard[]>;
   is_full_pass?: boolean;
+  player_name?: string;
 }
 
 type Module = "inventory" | "foundry" | "market" | "relics" | "rivens" | "timers" | "statistics" | "completionist";
@@ -191,21 +193,22 @@ function BlueprintIcon() {
 }
 
 function ItemImg({ imageName, category, size = 32 }: { imageName?: string; category: string; size?: number }) {
+  const baseUrl = useContext(ImgCacheDirContext);
+  const [localFailed, setLocalFailed] = useState(false);
   const [failed, setFailed] = useState(false);
   const style = { width: size, height: size, flexShrink: 0 as const };
   if (!imageName || failed) {
     if (category === "Blueprints") return <BlueprintIcon />;
     return <span className="item-img-fallback" style={{ ...style, fontSize: size * 0.35 }}>{category[0].toUpperCase()}</span>;
   }
+  if (imageName.startsWith("http") || imageName.startsWith("/")) {
+    return <img className="item-img" style={style} src={imageName} alt="" loading="lazy" onError={() => setFailed(true)} />;
+  }
+  const useLocal = Boolean(baseUrl) && !localFailed;
+  const src = useLocal ? `${baseUrl}/${imageName}` : `https://cdn.warframestat.us/img/${imageName}`;
   return (
-    <img
-      className="item-img"
-      style={style}
-      src={imageName.startsWith("http") || imageName.startsWith("/") ? imageName : `https://cdn.warframestat.us/img/${imageName}`}
-      alt=""
-      loading="lazy"
-      onError={() => setFailed(true)}
-    />
+    <img className="item-img" style={style} src={src} alt="" loading="lazy"
+      onError={() => useLocal ? setLocalFailed(true) : setFailed(true)} />
   );
 }
 
@@ -378,6 +381,118 @@ function ModularWindowPage() {
 }
 
 
+// ─── Memoized inventory card components ──────────────────────────────────────
+
+interface InvModCardProps {
+  unique_name: string;
+  name: string;
+  category: string;
+  image_name?: string | null;
+  ranks: { rank: number; count: number }[];
+  total: number;
+}
+const InvModCard = memo(function InvModCard({ unique_name, name, category, image_name, ranks, total }: InvModCardProps) {
+  return (
+    <div key={unique_name} className="inv-card inv-card-mod">
+      <div className="inv-card-img-wrap">
+        <ItemImg imageName={image_name ?? undefined} category={category} size={40} />
+      </div>
+      <div className="inv-card-name">{name}</div>
+      <div className="inv-card-cat">{category}</div>
+      <div className="mod-rank-table">
+        {ranks.map(r => (
+          <div key={r.rank} className={`mod-rank-row${r.count === 0 ? " mod-rank-zero" : ""}`}>
+            <span className="mod-rank-label">R{r.rank}</span>
+            <span className="mod-rank-count">{r.count}</span>
+          </div>
+        ))}
+      </div>
+      <div className="inv-card-qty mod-total">{fmt(total)}</div>
+    </div>
+  );
+}, (prev, next) =>
+  prev.unique_name === next.unique_name &&
+  prev.name === next.name &&
+  prev.total === next.total &&
+  prev.image_name === next.image_name &&
+  prev.ranks.length === next.ranks.length &&
+  prev.ranks.every((r, i) => r.rank === next.ranks[i].rank && r.count === next.ranks[i].count)
+);
+
+interface InvCardProps {
+  unique_name: string;
+  name: string;
+  category: string;
+  image_name?: string | null;
+  qty: number;
+  isFavorite: boolean;
+  changedAt: number | undefined;
+  recentDelta: number | null;
+  craftJobName: string | null;
+  masteryRank: number | undefined;
+  onToggleFavorite: (id: string) => void;
+}
+const InvCard = memo(function InvCard({
+  unique_name, name, category, image_name, qty,
+  isFavorite, changedAt, recentDelta, craftJobName, masteryRank, onToggleFavorite,
+}: InvCardProps) {
+  const nowSec = Date.now() / 1000;
+  const secAgo = changedAt != null ? nowSec - changedAt : null;
+  const isRecent = secAgo !== null && secAgo < 300;
+  const isZero = qty === 0 && !craftJobName;
+  const isMastered = masteryRank != null && masteryRank >= 30;
+  const showRank = masteryRank != null && masteryRank > 0;
+  return (
+    <div
+      className={`inv-card ${isZero ? "inv-card-zero" : ""} ${isRecent ? (recentDelta != null && recentDelta > 0 ? "inv-card-gained" : "inv-card-lost") : ""}`}>
+      <button
+        className={`inv-fav-star ${isFavorite ? "active" : ""}`}
+        title={isFavorite ? "Remove from Modular Window" : "Add to Modular Window"}
+        onClick={e => { e.stopPropagation(); onToggleFavorite(unique_name); }}
+      >{isFavorite ? "★" : "☆"}</button>
+      <div className="inv-mastery-row">
+        {isMastered
+          ? <span className="inv-mastery-star" title="Mastered">★</span>
+          : showRank
+            ? <span className="inv-mastery-rank" title={`Rank ${masteryRank}`}>R{masteryRank}</span>
+            : null}
+      </div>
+      <div className="inv-card-img-wrap">
+        <ItemImg imageName={image_name ?? undefined} category={category} size={48} />
+        {craftJobName && <span className="inv-foundry-icon" title={`Building — ${craftJobName}`}>⚒</span>}
+      </div>
+      <div className="inv-card-name">
+        {name}
+        {isRecent && secAgo !== null && (
+          <span className="item-updated">{Math.floor(secAgo / 60) === 0 ? "· now" : `· ${Math.floor(secAgo / 60)}m`}</span>
+        )}
+      </div>
+      <div className="inv-card-cat">{category}</div>
+      <div className={`inv-card-qty ${isZero ? "inv-card-qty-zero" : ""}`}>
+        {fmt(qty)}
+        {isRecent && recentDelta != null && (
+          <span className={`item-delta ${deltaClass(recentDelta)}`}>{deltaText(recentDelta)}</span>
+        )}
+      </div>
+    </div>
+  );
+}, (prev, next) => {
+  if (
+    prev.unique_name !== next.unique_name ||
+    prev.qty !== next.qty ||
+    prev.isFavorite !== next.isFavorite ||
+    prev.image_name !== next.image_name ||
+    prev.masteryRank !== next.masteryRank ||
+    prev.craftJobName !== next.craftJobName ||
+    prev.recentDelta !== next.recentDelta ||
+    prev.changedAt !== next.changedAt
+  ) return false;
+  // Recently-changed items must re-render so elapsed time stays fresh
+  const nowSec = Date.now() / 1000;
+  if (prev.changedAt != null && nowSec - prev.changedAt < 300) return false;
+  return true;
+});
+
 // ─── App ──────────────────────────────────────────────────────────────────────
 
 // RelicAndRivenTab is kept but now just shows RelicHelper — Rivens moved to own tab
@@ -399,6 +514,7 @@ export default function App() {
   const [crafting, setCrafting] = useState<CraftingJob[]>([]);
   const [masteryRank, setMasteryRank] = useState<number | null>(null);
   const [masteryData, setMasteryData] = useState<Record<string, number>>({});
+  const [playerName, setPlayerName] = useState<string | null>(null);
   const [wfConnected, setWfConnected] = useState(false);
   const [memoryProbing, setMemoryProbing] = useState(false);
   const [rawScanning, setRawScanning] = useState(false);
@@ -488,10 +604,9 @@ const [blobLogEnabled, setBlobLogEnabled] = useState(false);
   const [colorblindMode, setColorblindMode] = useState(() =>
     localStorage.getItem("ff-colorblind") === "true"
   );
-  const [wfLoginEmail, setWfLoginEmail] = useState("");
-  const [wfLoginPassword, setWfLoginPassword] = useState("");
   const [manualMsg, setManualMsg] = useState("");
   const [itemsRefreshKey, setItemsRefreshKey] = useState(0);
+  const [imgCacheDir, setImgCacheDir] = useState("");
 
   // ── Modular Window state ───────────────────────────────────────────────────
   const [tracked, setTracked] = useState<string[]>([]);
@@ -586,17 +701,21 @@ const [blobLogEnabled, setBlobLogEnabled] = useState(false);
     })();
     // Fire-and-forget: populates WFM_TOP_CACHE so the Statistics tab is instant
     invoke("get_wfm_top_items").catch(() => {});
+    invoke<string>("get_img_cache_dir").then(setImgCacheDir).catch(() => {});
   }, []); // eslint-disable-line
 
   // ── WFM: intercept window close to go invisible first ─────────────────────
   useEffect(() => {
     let unlistenFn: (() => void) | null = null;
     getCurrentWindow().onCloseRequested(async event => {
+      event.preventDefault(); // always prevent default; we handle all closes via force_quit
       if (wfmInvisibleOnCloseRef.current && wfmLoggedInRef.current) {
-        event.preventDefault();
-        try { await invoke("wfm_set_status", { status: "invisible" }); } catch {}
+        await Promise.race([
+          invoke("wfm_set_status", { status: "invisible" }).catch(() => {}),
+          new Promise<void>(resolve => setTimeout(resolve, 8000)),
+        ]);
       }
-      getCurrentWindow().destroy().catch(() => {});
+      invoke("force_quit").catch(() => {});
     }).then(fn => { unlistenFn = fn; });
     return () => { unlistenFn?.(); };
   }, []); // eslint-disable-line
@@ -736,9 +855,20 @@ if (typeof s.autoDiagEnabled === "boolean") {
   useEffect(() => {
     const unlisten = listen<InventoryUpdate>("inventory-update", (e) => {
       const p = e.payload;
-      setQuantities(p.quantities);
+      // Only replace quantities if the content actually changed.
+      // The monitor loop re-emits cached state periodically; without this guard
+      // every emit triggers a full 17k-item useMemo rebuild cascade.
+      setQuantities(prev => {
+        const next = p.quantities;
+        const prevKeys = Object.keys(prev);
+        const nextKeys = Object.keys(next);
+        if (prevKeys.length !== nextKeys.length) return next;
+        for (const k of nextKeys) { if (next[k] !== prev[k]) return next; }
+        return prev;
+      });
       if (p.crafting) setCrafting(p.crafting);
       if (p.mastery_rank != null) setMasteryRank(p.mastery_rank);
+      if (p.player_name) setPlayerName(p.player_name);
       if (p.mastery_data && Object.keys(p.mastery_data).length > 0)
         setMasteryData(prev => ({ ...prev, ...p.mastery_data }));
       // When Warframe restarts (was running → stopped → running again),
@@ -823,6 +953,14 @@ if (typeof s.autoDiagEnabled === "boolean") {
     return () => { unlisten.then(fn => fn()); };
   }, []);
 
+  // ── Player name (immediate, from EE.log "Logged in NAME") ───────────────
+  useEffect(() => {
+    const unlisten = listen<string>("player-name", e => {
+      setPlayerName(e.payload);
+    });
+    return () => { unlisten.then(fn => fn()); };
+  }, []);
+
   // ── Sync modular state from pop-out window ────────────────────────────────
   // When the pop-out saves (unstar, reorder), Rust emits settings-updated.
   // Compare before setting to avoid a save → emit → re-read → save loop.
@@ -898,6 +1036,7 @@ if (typeof s.autoDiagEnabled === "boolean") {
       setRecipeCount(status.recipe_count);
       setFetchMsg(`Loaded ${count.toLocaleString()} items, ${status.recipe_count.toLocaleString()} recipes`);
       setItemsRefreshKey(k => k + 1);
+      invoke("prewarm_image_cache").catch(() => {});
     } catch (e) {
       setFetchMsg(`Error: ${e}`);
     } finally {
@@ -1543,6 +1682,22 @@ if (typeof s.autoDiagEnabled === "boolean") {
     [categoryOwned, categoryTotals]
   );
 
+  const favoritesSet = useMemo(() => new Set(favorites), [favorites]);
+
+  const changeLogMap = useMemo(() => {
+    const m = new Map<string, QuantityChange>();
+    for (const c of changeLog) {
+      if (!m.has(c.unique_name)) m.set(c.unique_name, c);
+    }
+    return m;
+  }, [changeLog]);
+
+  const craftingMap = useMemo(() => {
+    const m = new Map<string, CraftingJob>();
+    for (const c of crafting) m.set(c.unique_name, c);
+    return m;
+  }, [crafting]);
+
   const visibleItems = useMemo(() => {
     const q = search.toLowerCase();
     const out: (CatalogItem & { qty: number })[] = [];
@@ -1589,6 +1744,7 @@ if (typeof s.autoDiagEnabled === "boolean") {
   // ─── Render ─────────────────────────────────────────────────────────────────
 
   return (
+    <ImgCacheDirContext.Provider value={imgCacheDir}>
     <div className="shell">
 
       {/* ── Header ── */}
@@ -1604,10 +1760,8 @@ if (typeof s.autoDiagEnabled === "boolean") {
         {masteryRank !== null && (
           <span className="mastery-badge" title="Mastery Rank">MR {masteryRank}</span>
         )}
-        {blobStage === "scanning" && (
-          <span className="blob-status-badge blob-status-scanning" title="Reading Warframe memory and processing inventory">
-            Processing Data…
-          </span>
+        {playerName && (
+          <span className="player-name-badge" title="Logged-in Warframe account">{playerName}</span>
         )}
         {blobStage === "done" && (
           <span className="blob-status-badge blob-status-done" title="Inventory loaded from Warframe memory">
@@ -1906,44 +2060,25 @@ if (typeof s.autoDiagEnabled === "boolean") {
                   </div>
 
                   {/* Account Login */}
-                  <div className="settings-section" style={{ opacity: companionApiEnabled ? 1 : 0.4, pointerEvents: companionApiEnabled ? "auto" : "none" }}>
-                    <div className="settings-section-title" style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      Account Login
-                      <HelpTip items={[
-                        { icon: "🔒", label: "Password security", desc: "Your password is hashed with Whirlpool (one-way) before being sent — it is never transmitted in plaintext and is never stored on disk. Only the resulting session token is kept in memory for this session." },
-                        { icon: "📱", label: "All platforms", desc: "Works for Steam, Xbox, and PlayStation accounts. Uses the same login as the official Warframe mobile companion app." },
-                        { icon: "🔄", label: "Auto-refresh", desc: "Once connected, inventory refreshes every 5 minutes automatically. Re-enter credentials if the session expires." },
-                      ]} />
+                  <div className="settings-section">
+                    <div className="settings-section-title">Account Login</div>
+                    <div style={{
+                      fontSize: 11, color: "var(--muted)", lineHeight: 1.6,
+                      background: "rgba(255,100,100,.07)", border: "1px solid rgba(255,100,100,.2)",
+                      borderRadius: 6, padding: "8px 10px",
+                    }}>
+                      <strong style={{ color: "#ff8080" }}>Login is temporarily unavailable.</strong>
+                      {" "}Digital Extremes encrypted their login API in March 2026, which blocked all third-party tools — including FrameForge — from authenticating on your behalf.
+                      {" "}PC players are not affected: inventory is synced automatically while the game is running.
                     </div>
-                    <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 8, lineHeight: 1.5 }}>
-                      Connect using your Warframe account email and password. Works for all platforms (Steam, Xbox, PlayStation) without needing the game running.
+                    <div style={{
+                      marginTop: 8, fontSize: 11, color: "var(--muted)", lineHeight: 1.6,
+                      background: "rgba(100,180,255,.06)", border: "1px solid rgba(100,180,255,.18)",
+                      borderRadius: 6, padding: "8px 10px",
+                    }}>
+                      FrameForge is actively exploring ways to restore inventory access for console and non-PC players.
+                      {" "}Follow the project for updates.
                     </div>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                      <input className="foundry-search" type="email" placeholder="Email" value={wfLoginEmail}
-                        onChange={e => setWfLoginEmail(e.target.value)} style={{ width: "100%", fontSize: 12 }} />
-                      <input className="foundry-search" type="password" placeholder="Password" value={wfLoginPassword}
-                        onChange={e => setWfLoginPassword(e.target.value)} style={{ width: "100%", fontSize: 12 }} />
-                      <button className="btn-secondary" style={{ alignSelf: "flex-start" }}
-                        disabled={!wfLoginEmail.trim() || !wfLoginPassword}
-                        onClick={async () => {
-                          setManualMsg("Logging in…");
-                          try {
-                            const [accountId, nonce] = await invoke<[string, string]>("warframe_login", {
-                              email: wfLoginEmail.trim(), password: wfLoginPassword
-                            });
-                            const data = await invoke<any>("fetch_warframe_inventory", {
-                              accountId, nonce, steamId: ""
-                            });
-                            manualCredsRef.current = { accountId, nonce };
-                            applyInventoryData(data);
-                            setWfConnected(true);
-                            wfConnectedRef.current = true;
-                            setManualMsg("Connected. Auto-refresh active every 5 min.");
-                            setWfLoginPassword("");
-                          } catch (e) { setManualMsg(`Failed: ${e}`); }
-                        }}>Log In</button>
-                    </div>
-                    {manualMsg && <div className="settings-msg" style={{ color: manualMsg.startsWith("F") ? "var(--red)" : "var(--green)" }}>{manualMsg}</div>}
                   </div>
 
                   {/* Modular Window */}
@@ -2453,85 +2588,38 @@ if (typeof s.autoDiagEnabled === "boolean") {
                     // Mods & Arcanes: single card with inline rank breakdown
                     if ((item.category === "Mods" || item.category === "Arcanes") && modCopiesMap[item.unique_name]) {
                       const copies = modCopiesMap[item.unique_name];
-                      // Build rank rows: 0 through highest rank seen, filling gaps with 0
                       const byRank: Record<number, number> = {};
                       for (const c of copies) byRank[c.rank ?? 0] = (byRank[c.rank ?? 0] ?? 0) + c.count;
                       const maxRank = Math.max(...Object.keys(byRank).map(Number));
                       const ranks = Array.from({ length: maxRank + 1 }, (_, r) => ({ rank: r, count: byRank[r] ?? 0 })).filter(r => r.count > 0);
-                      // Apply filterRank
                       if (filterRank !== null) {
                         const targetRank = filterRank === "unranked" ? 0 : filterRank as number;
                         if ((byRank[targetRank] ?? 0) === 0) return [];
                       }
                       const total = Object.values(byRank).reduce((a, b) => a + b, 0);
                       return [(
-                        <div key={item.unique_name} className="inv-card inv-card-mod">
-                          <div className="inv-card-img-wrap">
-                            <ItemImg imageName={item.image_name} category={item.category} size={40} />
-                          </div>
-                          <div className="inv-card-name">{item.name}</div>
-                          <div className="inv-card-cat">{item.category}</div>
-                          <div className="mod-rank-table">
-                            {ranks.map(r => (
-                              <div key={r.rank} className={`mod-rank-row${r.count === 0 ? " mod-rank-zero" : ""}`}>
-                                <span className="mod-rank-label">R{r.rank}</span>
-                                <span className="mod-rank-count">{r.count}</span>
-                              </div>
-                            ))}
-                          </div>
-                          <div className="inv-card-qty mod-total">{fmt(total)}</div>
-                        </div>
+                        <InvModCard key={item.unique_name}
+                          unique_name={item.unique_name} name={item.name}
+                          category={item.category} image_name={item.image_name}
+                          ranks={ranks} total={total} />
                       )];
                     }
 
                     // Normal item card
-                    const nowSec = Date.now() / 1000;
                     const changedAt = lastChanged[item.unique_name];
-                    const secAgo = changedAt ? nowSec - changedAt : null;
-                    const isRecent = secAgo !== null && secAgo < 300;
-                    const recentChange = isRecent ? changeLog.find(c => c.unique_name === item.unique_name) : null;
-                    const craftJob = crafting.find(c => c.unique_name === item.unique_name);
-                    const isZero = item.qty === 0 && !craftJob;
-                    const itemRank = inventory[item.unique_name]?.mastery_rank;
-                    const isMastered = itemRank != null && itemRank >= 30;
-                    const showRank = itemRank != null && itemRank > 0;
+                    const recentChange = changedAt != null ? changeLogMap.get(item.unique_name) : undefined;
+                    const craftJob = craftingMap.get(item.unique_name);
                     return [(
-                      <div key={item.unique_name}
-                        className={`inv-card ${isZero ? "inv-card-zero" : ""} ${isRecent ? (recentChange && recentChange.delta > 0 ? "inv-card-gained" : "inv-card-lost") : ""}`}>
-                        <button
-                          className={`inv-fav-star ${favorites.includes(item.unique_name) ? "active" : ""}`}
-                          title={favorites.includes(item.unique_name) ? "Remove from Modular Window" : "Add to Modular Window"}
-                          onClick={e => { e.stopPropagation(); toggleFavorite(item.unique_name); }}
-                        >{favorites.includes(item.unique_name) ? "★" : "☆"}</button>
-                        {/* Fixed-height mastery slot — always present so image stays at same vertical position */}
-                        <div className="inv-mastery-row">
-                          {isMastered
-                            ? <span className="inv-mastery-star" title="Mastered">★</span>
-                            : showRank
-                              ? <span className="inv-mastery-rank" title={`Rank ${itemRank}`}>R{itemRank}</span>
-                              : null}
-                        </div>
-                        {/* Image with overlaid foundry badge */}
-                        <div className="inv-card-img-wrap">
-                          <ItemImg imageName={item.image_name} category={item.category} size={48} />
-                          {craftJob && <span className="inv-foundry-icon" title={`Building — ${craftJob.item_name}`}>⚒</span>}
-                        </div>
-                        {/* Name + category */}
-                        <div className="inv-card-name">
-                          {item.name}
-                          {isRecent && secAgo !== null && (
-                            <span className="item-updated">{Math.floor(secAgo / 60) === 0 ? "· now" : `· ${Math.floor(secAgo / 60)}m`}</span>
-                          )}
-                        </div>
-                        <div className="inv-card-cat">{item.category}</div>
-                        {/* Quantity + recent delta */}
-                        <div className={`inv-card-qty ${isZero ? "inv-card-qty-zero" : ""}`}>
-                          {fmt(item.qty)}
-                          {isRecent && recentChange && (
-                            <span className={`item-delta ${deltaClass(recentChange.delta)}`}>{deltaText(recentChange.delta)}</span>
-                          )}
-                        </div>
-                      </div>
+                      <InvCard key={item.unique_name}
+                        unique_name={item.unique_name} name={item.name}
+                        category={item.category} image_name={item.image_name}
+                        qty={item.qty}
+                        isFavorite={favoritesSet.has(item.unique_name)}
+                        changedAt={changedAt}
+                        recentDelta={recentChange?.delta ?? null}
+                        craftJobName={craftJob?.item_name ?? null}
+                        masteryRank={inventory[item.unique_name]?.mastery_rank}
+                        onToggleFavorite={toggleFavorite} />
                     )];
                   })
                 )}
@@ -2664,5 +2752,6 @@ if (typeof s.autoDiagEnabled === "boolean") {
 
       </div>
     </div>
+    </ImgCacheDirContext.Provider>
   );
 }

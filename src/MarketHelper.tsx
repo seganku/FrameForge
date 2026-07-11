@@ -1,5 +1,6 @@
-import { useState, useEffect, useMemo, useRef, memo } from "react";
+import { useState, useEffect, useMemo, useRef, memo, useContext } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { ImgCacheDirContext } from "./ImgCacheDir";
 import { listen } from "@tauri-apps/api/event";
 import { HelpTip } from "./HelpTip";
 import WfmTrading from "./WfmTrading";
@@ -104,11 +105,18 @@ function normalizeForWfm(name: string): string {
 }
 
 function ItemImg({ imageName, size = 32 }: { imageName?: string; size?: number }) {
-  const [failed, setFailed] = useState(false);
+  const baseUrl = useContext(ImgCacheDirContext);
+  const [localFailed, setLocalFailed] = useState(false);
+  const [cdnFailed,   setCdnFailed]   = useState(false);
   const s = { width: size, height: size, objectFit: "contain" as const, flexShrink: 0, borderRadius: 4 };
-  if (!imageName || failed)
+  if (!imageName || cdnFailed)
     return <span style={{ ...s, background: "rgba(255,255,255,.06)", border: "1px solid #30363d", display: "flex", alignItems: "center", justifyContent: "center", fontSize: size * .3, color: "#8b949e" }}>P</span>;
-  return <img style={s} src={`https://cdn.warframestat.us/img/${imageName}`} alt="" loading="lazy" onError={() => setFailed(true)} />;
+  const useLocal = Boolean(baseUrl) && !localFailed;
+  const src = useLocal
+    ? `${baseUrl}/${imageName}`
+    : `https://cdn.warframestat.us/img/${imageName}`;
+  return <img style={s} src={src} alt="" loading="lazy"
+    onError={() => useLocal ? setLocalFailed(true) : setCdnFailed(true)} />;
 }
 
 // ─── Set card ─────────────────────────────────────────────────────────────────
