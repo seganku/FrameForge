@@ -25,26 +25,30 @@ interface SyndicateStore {
 // ── Completion status ─────────────────────────────────────────────────────────
 // "complete"  = built/owned final item (or mod/sigil in inventory)
 // "blueprint" = have the blueprint but haven't built it yet
+// "subsumed"  = warframe was consumed by Helminth (Infested Foundry)
 // "none"      = not owned at all
 
-type CompStatus = "complete" | "blueprint" | "none";
+type CompStatus = "complete" | "blueprint" | "subsumed" | "none";
 
 function itemStatus(item: SyndicateItem, inventory: Record<string, InventoryItem>): CompStatus {
   const qty = inventory[item.unique_name]?.quantity ?? item.owned;
   if (item.result_unique) {
     // This is a blueprint — check if the crafted item is built (path alias lookup)
-    const resultQty = inventory[item.result_unique]?.quantity ?? item.result_owned;
+    const resultItem = inventory[item.result_unique];
+    if (resultItem?.subsumed) return "subsumed";
+    const resultQty = resultItem?.quantity ?? item.result_owned;
     if (resultQty > 0) return "complete";
     if (qty > 0) return "blueprint";
     return "none";
   }
   // Mod, sigil, specter, part — directly owned
+  if (inventory[item.unique_name]?.subsumed) return "subsumed";
   return qty > 0 ? "complete" : "none";
 }
 
 // ── Syndicate metadata ────────────────────────────────────────────────────────
 
-type SynGroup = "main" | "openworld" | "other";
+type SynGroup = "main" | "openworld" | "other" | "lab";
 
 interface SynMeta {
   color: string;
@@ -69,6 +73,16 @@ const SYNDICATE_META: Record<string, SynMeta> = {
   "The Holdfasts":       { color: "#f39c12", short: "Holdfasts", group: "openworld", tierOrder: ["Neutral", "Fallen", "Watcher", "Guardian", "Seraph", "Angel"] },
   "Kahl's Garrison":     { color: "#7f8c8d", short: "Garrison",  group: "openworld", tierOrder: ["Encampment", "Fort", "Settlement", "Home"] },
   "Cavia":               { color: "#e91e8c", short: "Cavia",     group: "openworld", tierOrder: [] },
+  // ── Clan dojo research labs ──
+  // tierOrder uses raw WFCD category names. Unknown categories append after the list.
+  "Bio Lab":            { color: "#66bb6a", short: "Bio",      group: "lab", tierOrder: ["Primary", "Secondary", "Melee", "Companions", "Resources", "Misc"] },
+  "Chem Lab":           { color: "#ffa726", short: "Chem",     group: "lab", tierOrder: ["Primary", "Secondary", "Melee", "Resources", "Misc"] },
+  "Energy Lab":         { color: "#42a5f5", short: "Energy",   group: "lab", tierOrder: ["Primary", "Secondary", "Melee", "Companions", "Resources", "Misc"] },
+  "Tenno Lab":          { color: "#ab47bc", short: "Tenno",    group: "lab", tierOrder: ["Warframes", "Archwing", "Parts", "Primary", "Secondary", "Melee", "Resources", "Misc", "Blueprints"] },
+  "Orokin Lab":         { color: "#c8a951", short: "Orokin",   group: "lab", tierOrder: ["Misc"] },
+  "Ventkids Bash Lab":  { color: "#8d6e63", short: "Ventkids", group: "lab", tierOrder: ["Warframes", "Parts", "Melee", "Blueprints", "Misc"] },
+  "Dry Docks":          { color: "#78909c", short: "Dry Dock", group: "lab", tierOrder: ["Misc"] },
+  "Dagath's Hollow":    { color: "#7e57c2", short: "Dagath",   group: "lab", tierOrder: ["Warframes", "Parts", "Melee", "Blueprints"] },
   // ── Sub-syndicates & others ──
   "The Quills":          { color: "#ecf0f1", short: "Quills",    group: "other",     tierOrder: ["Neutral", "Mote", "Observer", "Adherent", "Instrument", "Architect"] },
   "Vox Solaris":         { color: "#26a69a", short: "Vox Sol.",  group: "other",     tierOrder: ["Neutral", "Operative", "Agent", "Hand", "Instrument", "Shadow"] },
@@ -82,6 +96,7 @@ const GROUP_LABELS: Record<SynGroup, string> = {
   main:      "Main Syndicates",
   openworld: "Open World",
   other:     "Other",
+  lab:       "Research Labs",
 };
 
 // ── Image component ───────────────────────────────────────────────────────────
@@ -111,6 +126,7 @@ function SynItemImg({ imageName, category }: { imageName?: string; category: str
 function StatusBadge({ status }: { status: CompStatus }) {
   if (status === "complete")  return <span className="syn-item-status status-complete">✓</span>;
   if (status === "blueprint") return <span className="syn-item-status status-blueprint">BP</span>;
+  if (status === "subsumed")  return <span className="syn-item-status status-subsumed" title="Consumed by Helminth">H</span>;
   return <span className="syn-item-status status-none">—</span>;
 }
 
@@ -138,9 +154,13 @@ export default function Syndicates({ inventory, filters, onFiltersChange }: Prop
   const isFiltered = search !== "" || missingOnly;
 
   useEffect(() => {
-    invoke<SyndicateStore[]>("get_syndicate_stores")
-      .then(s => { setStores(s); setLoading(false); })
-      .catch(() => setLoading(false));
+    Promise.all([
+      invoke<SyndicateStore[]>("get_syndicate_stores"),
+      invoke<SyndicateStore[]>("get_research_lab_stores"),
+    ]).then(([syn, labs]) => {
+      setStores([...syn, ...labs]);
+      setLoading(false);
+    }).catch(() => setLoading(false));
   }, []);
 
   // Syndicates visible in current group
@@ -212,7 +232,7 @@ export default function Syndicates({ inventory, filters, onFiltersChange }: Prop
     <div className="syn-root">
       {/* ── Group selector ── */}
       <div className="syn-groups">
-        {(["main", "openworld", "other"] as SynGroup[]).map(g => (
+        {(["main", "openworld", "other", "lab"] as SynGroup[]).map(g => (
           <button
             key={g}
             className={`syn-group-btn ${activeGroup === g ? "active" : ""}`}
@@ -304,7 +324,7 @@ export default function Syndicates({ inventory, filters, onFiltersChange }: Prop
                   return (
                     <div
                       key={item.unique_name}
-                      className={`syn-item ${status === "none" ? "missing" : ""} status-row-${status}`}
+                      className={`syn-item ${status === "none" ? "missing" : ""} status-row-${status}`.trim()}
                     >
                       <SynItemImg imageName={item.image_name} category={item.category} />
                       <div className="syn-item-info">

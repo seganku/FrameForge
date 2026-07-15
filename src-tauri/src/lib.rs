@@ -885,45 +885,68 @@ struct WfmRivenAttribute {
     value:    f64,
 }
 
-// ─── Warframe.market rate limiter ─────────────────────────────────────────────
-// WFM allows ≤3 requests per second. Every WFM HTTP call must call wfm_wait()
-// first. Uses a sliding-window algorithm: tracks timestamps of the last 3
-// requests and sleeps until the oldest is >1 second old before allowing another.
+// ─── Warframe.market rate limiters ────────────────────────────────────────────
+// Two separate sliding-window limiters:
+//   wfm_wait()         — general: ≤3 requests per second (all WFM endpoints)
+//   wfm_auction_wait() — auction: ≤10 requests per minute AND ≤3 per second
+//                        (rivens, liches, sisters — /v1/auctions/... endpoints)
 
 struct WfmRateLimiter {
     times: std::collections::VecDeque<std::time::Instant>,
+    limit: usize,
+    window: std::time::Duration,
 }
 
 impl WfmRateLimiter {
-    fn new() -> Self { Self { times: std::collections::VecDeque::new() } }
+    fn new(limit: usize, window: std::time::Duration) -> Self {
+        Self { times: std::collections::VecDeque::new(), limit, window }
+    }
 
     /// Returns None if a slot is available (and records the timestamp),
     /// or Some(duration) if the caller should sleep before retrying.
     /// Mutex is released BEFORE the caller sleeps — no blocking while holding the lock.
     fn try_acquire(&mut self) -> Option<std::time::Duration> {
-        const LIMIT: usize = 3;
-        const WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
         let now = std::time::Instant::now();
         while let Some(&front) = self.times.front() {
-            if now.duration_since(front) >= WINDOW { self.times.pop_front(); } else { break; }
+            if now.duration_since(front) >= self.window { self.times.pop_front(); } else { break; }
         }
-        if self.times.len() < LIMIT {
+        if self.times.len() < self.limit {
             self.times.push_back(now);
             None
         } else {
             let oldest = *self.times.front().unwrap();
-            Some(WINDOW.saturating_sub(now.duration_since(oldest)) + std::time::Duration::from_millis(10))
+            Some(self.window.saturating_sub(now.duration_since(oldest)) + std::time::Duration::from_millis(10))
         }
     }
 }
 
 static WFM_LIMITER: std::sync::OnceLock<std::sync::Mutex<WfmRateLimiter>> =
     std::sync::OnceLock::new();
+static WFM_AUCTION_LIMITER: std::sync::OnceLock<std::sync::Mutex<WfmRateLimiter>> =
+    std::sync::OnceLock::new();
 
 /// Call this before every warframe.market HTTP request.
 /// Sleeps without holding the mutex so other callers are not blocked during the wait.
 fn wfm_wait() {
-    let limiter = WFM_LIMITER.get_or_init(|| std::sync::Mutex::new(WfmRateLimiter::new()));
+    let limiter = WFM_LIMITER.get_or_init(|| std::sync::Mutex::new(
+        WfmRateLimiter::new(3, std::time::Duration::from_secs(1))
+    ));
+    loop {
+        let sleep_dur = limiter.lock().unwrap_or_else(|e| e.into_inner()).try_acquire();
+        match sleep_dur {
+            None => break,
+            Some(d) => std::thread::sleep(d),
+        }
+    }
+}
+
+/// Call this before every /v1/auctions/... request (rivens, liches, sisters).
+/// Enforces both the general 3/sec limit and the contract-specific 10/min limit.
+fn wfm_auction_wait() {
+    wfm_wait();
+    let limiter = WFM_AUCTION_LIMITER.get_or_init(|| std::sync::Mutex::new(
+        WfmRateLimiter::new(10, std::time::Duration::from_secs(60))
+    ));
     loop {
         let sleep_dur = limiter.lock().unwrap_or_else(|e| e.into_inner()).try_acquire();
         match sleep_dur {
@@ -3007,7 +3030,7 @@ fn wfm_debug_dump(state: State<AppState>, path: String) -> Result<String, String
 /// Exposed so the browser console can call: window.__wfmAttrs()
 #[tauri::command]
 fn wfm_get_riven_attributes() -> Result<Vec<String>, String> {
-    wfm_wait();
+    wfm_auction_wait();
     let json: serde_json::Value = ureq::get("https://api.warframe.market/v1/auctions/search")
         .query("type", "riven")
         .set("language", "en").set("platform", "pc")
@@ -3118,7 +3141,7 @@ fn wfm_create_riven_auction(
     });
     // WFM v1 requires buyout_price to be present in the payload (null = no buyout).
     payload["buyout_price"] = serde_json::json!(buyout_price);
-    wfm_wait();
+    wfm_auction_wait();
     let resp = wfm_request("POST", "/v1/auctions/create", &auth)
         .send_json(payload)
         .map_err(|e| match e {
@@ -3154,7 +3177,7 @@ async fn wfm_get_my_riven_auctions(state: tauri::State<'_, AppState>) -> Result<
     };
     tauri::async_runtime::spawn_blocking(move || {
         // Phase 1: profile endpoint with Bearer auth — returns visible auctions.
-        wfm_wait();
+        wfm_auction_wait();
         let profile_resp: serde_json::Value = wfm_request(
             "GET", &format!("/v1/profile/{}/auctions", username), &v1_auth,
         )
@@ -3174,7 +3197,7 @@ async fn wfm_get_my_riven_auctions(state: tauri::State<'_, AppState>) -> Result<
         // Phase 2: fetch each stored ID that wasn't in the public list (i.e. hidden auctions).
         for id in &stored_ids {
             if seen_ids.contains(id) { continue; }
-            wfm_wait();
+            wfm_auction_wait();
             let entry: serde_json::Value = match wfm_request(
                 "GET", &format!("/v1/auctions/entry/{}", id), &v1_auth,
             ).call() {
@@ -3208,7 +3231,7 @@ fn save_auction_ids(state: &State<AppState>) {
 #[tauri::command]
 fn wfm_delete_auction(state: State<AppState>, auction_id: String) -> Result<(), String> {
     let auth = session_v1_auth(&state)?;
-    wfm_wait();
+    wfm_auction_wait();
     wfm_request("PUT", &format!("/v1/auctions/entry/{}/close", auction_id), &auth)
         .call()
         .map_err(|e| match e {
@@ -3227,7 +3250,7 @@ fn wfm_delete_auction(state: State<AppState>, auction_id: String) -> Result<(), 
 #[tauri::command]
 fn wfm_set_auction_visible(state: State<AppState>, auction_id: String, visible: bool) -> Result<(), String> {
     let auth = session_v1_auth(&state)?;
-    wfm_wait();
+    wfm_auction_wait();
     wfm_request("PUT", &format!("/v1/auctions/entry/{}", auction_id), &auth)
         .send_json(serde_json::json!({ "visible": visible }))
         .map_err(|e| match e {
@@ -6332,6 +6355,265 @@ fn get_syndicate_stores(state: State<AppState>) -> Vec<SyndicateStore> {
     result
 }
 
+// ─── Research lab stores ─────────────────────────────────────────────────────
+
+/// Returns clan dojo research lab stores, one per lab.
+///
+/// Items are discovered by scanning the WFCD catalog for unique_name paths that
+/// contain the lab's path segment (e.g. ".../BioLab/...").  This is authoritative
+/// and self-updating — no item list hardcoding needed.
+///
+/// For each discovered item:
+///   • If a matching "<Name> Blueprint" exists in the catalog:
+///     unique_name = blueprint path, result_unique = built-item path
+///     → Complete / Blueprint / None status in the UI.
+///   • Otherwise (no blueprint entry in WFCD):
+///     unique_name = built-item path → Complete / None status.
+///
+/// Consumable / resource categories (Gear, Resources, Misc) are excluded since
+/// owning 0 restores does not mean the research is incomplete.
+#[tauri::command]
+fn get_research_lab_stores(state: State<AppState>) -> Vec<SyndicateStore> {
+    // Hardcoded item display names per lab (base name, no " Blueprint" suffix).
+    // Looked up by name in the WFCD catalog; items not found are silently skipped.
+    const LABS: &[(&str, &[&str])] = &[
+        ("Bio Lab", &[
+            // Resources
+            "Infested Catalyst", "Mutagen Mass",
+            // Consumables
+            "Squad Health Restore (Medium)", "Squad Health Restore (Large)",
+            // Weapons / Companions
+            "Acrid", "Bubonico", "Caustacyst", "Catabolyst", "Cerata",
+            "Djinn", "Dual Ichor", "Dual Toxocyst", "Embolist", "Hema",
+            "Mios", "Mutalist Quanta", "Paracyst", "Phage", "Pox",
+            "Pupacyst", "Scoliac", "Synapse", "Torid",
+        ]),
+        ("Chem Lab", &[
+            // Resources
+            "Detonite Injector",
+            // Consumables
+            "Squad Ammo Restore (Medium)", "Squad Ammo Restore (Large)",
+            // Weapons
+            "Ack & Brunt", "Argonak", "Buzlok", "Grinlok", "Grattler",
+            "Ignis", "Ignis Wraith", "Javlok", "Jat Kittag", "Jat Kusar",
+            "Kesheg", "Knux", "Kohmak", "Marelok", "Nukor",
+            "Ogris", "Sydon", "Twin Krohkur",
+        ]),
+        ("Energy Lab", &[
+            // Resources
+            "Fieldron", "Antiserum Injector",
+            // Consumables
+            "Squad Shield Restore (Medium)", "Squad Shield Restore (Large)",
+            "Squad Energy Restore (Medium)", "Squad Energy Restore (Large)",
+            // Weapons / Companions
+            "Amprex", "Arca Plasmor", "Arca Scisco", "Battacor", "Convectrix",
+            "Cycron", "Cyanex", "Dera", "Dual Cestra", "Falcor",
+            "Ferrox", "Flux Rifle", "Glaxion", "Helios", "Komorex",
+            "Kreska", "Lanka", "Lenz", "Ocucor", "Opticor",
+            "Prova", "Quanta", "Serro", "Spectra", "Staticor", "Supra",
+        ]),
+        ("Tenno Lab", &[
+            // Misc / consumables
+            "Air Support Charges", "Cipher", "Synthula", "Loc-Pin", "Gravimag",
+            "Calcifin Stim", "Adrenal Stim", "Refract Stim", "Clotra Stim",
+            // Segments
+            "Kavat Incubator Upgrade Segment", "Landing Craft Foundry Segment",
+            "Nutrio Incubator Upgrade Segment",
+            // Weapons
+            "Akstiletto", "Anku", "Attica", "Baza", "Cassowar",
+            "Castanas", "Daikyu", "Dark Split-Sword", "Dual Raza", "Endura",
+            "Fluctus", "Gazal Machete", "Guandao", "Gunsen", "Lacera",
+            "Larkspur", "Masseter", "Nami Skyla", "Nikana", "Okina",
+            "Pyrana", "Scourge", "Shaku", "Silva & Aegis", "Sybaris",
+            "Talons", "Tenora", "Tonbo", "Veldt", "Velocitus",
+            "Venato", "Venka", "Zakti",
+            // Warframes + components
+            "Banshee", "Banshee Chassis", "Banshee Neuroptics", "Banshee Systems",
+            "Nezha",   "Nezha Chassis",   "Nezha Neuroptics",   "Nezha Systems",
+            "Volt",    "Volt Chassis",    "Volt Neuroptics",    "Volt Systems",
+            "Wukong",  "Wukong Chassis",  "Wukong Neuroptics",  "Wukong Systems",
+            "Zephyr",  "Zephyr Chassis",  "Zephyr Neuroptics",  "Zephyr Systems",
+            // Archwings + components
+            "Amesha", "Amesha Harness", "Amesha Systems", "Amesha Wings",
+            "Elytron", "Elytron Harness", "Elytron Systems", "Elytron Wings",
+            "Itzal",   "Itzal Harness",   "Itzal Systems",   "Itzal Wings",
+        ]),
+        ("Orokin Lab", &[
+            "Bleeding Dragon Key", "Decaying Dragon Key",
+            "Extinguished Dragon Key", "Hobbled Dragon Key",
+        ]),
+        ("Ventkids Bash Lab", &[
+            // Yareli components (base blueprint from Waverider quest, not dojo)
+            "Yareli Neuroptics", "Yareli Chassis", "Yareli Systems",
+            // Ghoulsaw + components
+            "Ghoulsaw", "Ghoulsaw Blade", "Ghoulsaw Chassis", "Ghoulsaw Engine", "Ghoulsaw Grip",
+            // Emotes / cosmetics
+            "Greedy Milk", "Hang Tenno", "Puppeteer",
+            "Ostron Explorer", "Ostron Gatherer", "Ostron Relaxed", "Ostron Trader Woman",
+            "Solaris Foreman", "Solaris Hazard Worker", "Solaris Rig Jockey",
+        ]),
+        ("Dry Docks", &[
+            // Railjack weapons (Mk I/II/III — WFCD uses lowercase roman numerals but lookup is case-insensitive)
+            "Apoc Mk I",      "Apoc Mk II",      "Apoc Mk III",
+            "Carcinnox Mk I", "Carcinnox Mk II", "Carcinnox Mk III",
+            "Cryophon Mk I",  "Cryophon Mk II",  "Cryophon Mk III",
+            "Galvarc Mk I",   "Galvarc Mk II",   "Galvarc Mk III",
+            "Glazio Mk I",    "Glazio Mk II",    "Glazio Mk III",
+            "Laith Mk I",     "Laith Mk II",     "Laith Mk III",
+            "Milati Mk I",    "Milati Mk II",    "Milati Mk III",
+            "Photor Mk I",    "Photor Mk II",    "Photor Mk III",
+            "Pulsar Mk I",    "Pulsar Mk II",    "Pulsar Mk III",
+            "Talyn Mk I",     "Talyn Mk II",     "Talyn Mk III",
+            "Tycho Seeker Mk I", "Tycho Seeker Mk II", "Tycho Seeker Mk III",
+            "Vort Mk I",      "Vort Mk II",      "Vort Mk III",
+            // Railjack components
+            "Engines Mk I",     "Engines Mk II",     "Engines Mk III",
+            "Plating Mk I",     "Plating Mk II",     "Plating Mk III",
+            "Reactor Mk I",     "Reactor Mk II",     "Reactor Mk III",
+            "Shield Array Mk I","Shield Array Mk II","Shield Array Mk III",
+        ]),
+        ("Dagath's Hollow", &[
+            // Dagath warframe + components
+            "Dagath", "Dagath Chassis", "Dagath Neuroptics", "Dagath Systems",
+            // Dorrclave weapon + components (components are raw blueprints in WFCD)
+            "Dorrclave", "Dorrclave Blade", "Dorrclave Hilt", "Dorrclave Hook", "Dorrclave String",
+        ]),
+    ];
+
+    // Build reverse ingredient map before acquiring other locks.
+    // ingredient_unique_name → parent_unique_name (from ExportRecipes data)
+    let ingredient_to_parent: std::collections::HashMap<String, String> = {
+        let recipes = state.recipes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = std::collections::HashMap::new();
+        for (parent_unique, components) in recipes.iter() {
+            for comp in components {
+                map.insert(comp.unique_name.clone(), parent_unique.clone());
+            }
+        }
+        map
+    };
+
+    let items = state.wfcd_items.lock().unwrap_or_else(|e| e.into_inner());
+    let qtys  = state.current_quantities.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Build lowercase-name → index for blueprint ↔ built-item pairing
+    let by_name: std::collections::HashMap<String, usize> = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| (item.name.to_lowercase(), i))
+        .collect();
+
+    LABS.iter().map(|(lab_name, item_names)| {
+        let mut store_items: Vec<SyndicateStoreItem> = Vec::new();
+
+        for &base_name in item_names.iter() {
+            let bp_key   = format!("{} blueprint", base_name.to_lowercase());
+            let item_key = base_name.to_lowercase();
+
+            let (unique_name, owned, result_unique, result_owned, category, image_name) =
+                if let Some(&bi) = by_name.get(&bp_key) {
+                    // Blueprint found — pair with built item if it exists
+                    let bp = &items[bi];
+                    let bp_owned = qtys.get(&bp.unique_name).copied().unwrap_or(0) as u32;
+                    let (ru, ro, cat, img) = match by_name.get(&item_key) {
+                        Some(&wi) => {
+                            let w = &items[wi];
+                            let ro = qtys.get(&w.unique_name).copied().unwrap_or(0) as u32;
+                            (Some(w.unique_name.clone()), ro, w.category.clone(), w.image_name.clone())
+                        }
+                        None => (None, 0, bp.category.clone(), bp.image_name.clone()),
+                    };
+                    (bp.unique_name.clone(), bp_owned, ru, ro, cat, img)
+                } else if let Some(&wi) = by_name.get(&item_key) {
+                    // No separate blueprint entry — track the built item directly
+                    let w = &items[wi];
+                    let wo = qtys.get(&w.unique_name).copied().unwrap_or(0) as u32;
+                    (w.unique_name.clone(), wo, None, 0, w.category.clone(), w.image_name.clone())
+                } else {
+                    continue; // not in catalog yet, skip silently
+                };
+
+            store_items.push(SyndicateStoreItem {
+                unique_name,
+                name:     base_name.to_string(),
+                tier:     category.clone(),
+                category,
+                image_name,
+                ducats:   None,
+                owned,
+                result_unique,
+                result_owned,
+            });
+        }
+
+        // Post-pass: components consumed during crafting show qty=0 even when the
+        // final assembled item is owned. Two sub-passes handle this:
+        //
+        // Pass A — recipe-based (blueprint+built-item pairs like warframe components):
+        //   If the built part is an ingredient in ExportRecipes AND the parent is
+        //   currently in qtys, redirect result_unique → parent and set result_owned.
+        //   We also set result_unique even when parent_qty==0 so the TypeScript live
+        //   inventory lookup fires correctly once a scan runs later.
+        //
+        // Pass B — name-prefix fallback (directly-tracked items like Dorrclave Blade):
+        //   These have result_unique==None; we find the parent item in the same lab
+        //   by name prefix and set result_unique to its built unique_name. result_owned
+        //   stays 0 so the TypeScript live-inventory path (not the stale Rust qty) is
+        //   what decides "complete".
+
+        // Snapshot parent→result_unique map before mutating store_items.
+        let parent_ru_map: std::collections::HashMap<String, String> = store_items
+            .iter()
+            .filter_map(|si| si.result_unique.as_ref().map(|ru| (si.name.clone(), ru.clone())))
+            .collect();
+
+        for si in &mut store_items {
+            if si.result_owned > 0 { continue; }
+
+            if let Some(built_unique) = si.result_unique.as_deref() {
+                // Pass A: warframe/archwing component parts only.
+                // Guard on tier=="Parts" so weapons that are ingredients for another weapon
+                // (e.g. Kohmak → Twin Kohmak) are not incorrectly redirected.
+                if si.tier == "Parts" {
+                    if let Some(parent_unique) = ingredient_to_parent.get(built_unique) {
+                        let parent_qty = qtys.get(parent_unique).copied().unwrap_or(0) as u32;
+                        // Always point at the parent so TypeScript live inventory can pick it up.
+                        si.result_unique = Some(parent_unique.clone());
+                        if parent_qty > 0 { si.result_owned = parent_qty; }
+                    }
+                }
+            } else {
+                // Pass B: directly-tracked item (e.g. Dorrclave Blade) — no built-part pair.
+                // First try recipe map by the item's own unique.
+                let found_via_recipe = if let Some(parent_unique) =
+                    ingredient_to_parent.get(&si.unique_name)
+                {
+                    let parent_qty = qtys.get(parent_unique).copied().unwrap_or(0) as u32;
+                    si.result_unique = Some(parent_unique.clone());
+                    if parent_qty > 0 { si.result_owned = parent_qty; }
+                    true
+                } else { false };
+
+                // Fallback: name-prefix heuristic (catches content not in ExportRecipes).
+                if !found_via_recipe {
+                    if let Some(parent_ru) = parent_ru_map.iter().find_map(|(pname, ru)| {
+                        (si.name.len() > pname.len()
+                            && si.name.starts_with(pname.as_str())
+                            && si.name.as_bytes().get(pname.len()) == Some(&b' '))
+                        .then_some(ru)
+                    }) {
+                        si.result_unique = Some(parent_ru.clone());
+                        // result_owned stays 0 — TypeScript live inventory decides "complete".
+                    }
+                }
+            }
+        }
+
+        store_items.sort_by(|a, b| a.tier.cmp(&b.tier).then(a.name.cmp(&b.name)));
+        SyndicateStore { name: lab_name.to_string(), items: store_items }
+    }).collect()
+}
+
 /// Fetch and parse the DE official Warframe worldstate.
 /// Runs on a blocking thread so the async runtime is never stalled.
 #[tauri::command]
@@ -7396,6 +7678,7 @@ pub fn run() {
             get_weapon_dispositions,
             save_api_inventory,
             get_syndicate_stores,
+            get_research_lab_stores,
             fetch_worldstate,
             get_warframe_window_rect,
             get_overlay_session_log,

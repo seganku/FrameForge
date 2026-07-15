@@ -565,7 +565,7 @@ const [blobLogEnabled, setBlobLogEnabled] = useState(false);
   const [marketFilters, setMarketFilters] = useState(MARKET_FILTERS_DEFAULT);
   const [relicFilters, setRelicFilters] = useState(RELIC_FILTERS_DEFAULT);
   const [syndicateFilters, setSyndicateFilters] = useState({
-    activeGroup: "main" as "main" | "openworld" | "other",
+    activeGroup: "main" as "main" | "openworld" | "other" | "lab",
     activeTab: "Steel Meridian", missingOnly: false, search: "",
   });
   const [statsTab, setStatsTab] = useState<"trade" | "item">("trade");
@@ -1598,6 +1598,7 @@ if (typeof s.autoDiagEnabled === "boolean") {
       ...Object.keys(masteryData),
       ...Object.keys(archonShards),
       ...Object.keys(scannerMods),
+      ...subsummedWarframes,
     ]);
 
     const inv: Record<string, InventoryItem> = {};

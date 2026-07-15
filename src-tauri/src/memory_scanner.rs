@@ -932,19 +932,14 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
                 buf.as_mut_ptr() as *mut c_void, read_cap, &mut n) } != 0 && n >= 8;
             if read_ok {
                 let chunk = &buf[..n];
-                let has_start = chunk.windows(START_MARKER.len()).any(|w| w == START_MARKER);
                 let is_mission = chunk.windows(MISSION_DELTA.len()).any(|w| w == MISSION_DELTA);
-                if has_start && !is_mission {
-                    // Stitch forward from the cached region using the same approach as the main walk.
-                    // Seed from the JSON opening { which may precede "SubscribedToEmails" — field
-                    // order in the FULL_ACCOUNT blob varies by account.
-                    let start_off = chunk.windows(START_MARKER.len())
-                        .position(|w| w == START_MARKER).unwrap_or(0);
-                    let json_open = chunk[..start_off + 1]
-                        .windows(2)
-                        .position(|w| w == b"{\"")
-                        .unwrap_or(start_off);
-                    let mut stitched = chunk[json_open..].to_vec();
+                let has_anchor = ANCHORS.iter().any(|a| chunk.windows(a.len()).any(|w| w == *a));
+                let has_lotus  = chunk.windows(LOTUS_KEY.len()).any(|w| w == LOTUS_KEY);
+                // cached_addr is the exact byte of the blob's outer {, so seed from byte 0.
+                // Accept regions that are blob data even when SubscribedToEmails is in a
+                // later region (field order varies by account).
+                if !is_mission && (has_anchor || has_lotus) && chunk.starts_with(b"{\"") {
+                    let mut stitched = chunk.to_vec();
                     let mut walk = cached_addr + n;
                     while stitched.len() < MAX_SCAN && find_blob_end(&stitched).is_none() {
                         let mut nmbi = unsafe { mem::zeroed::<MEMORY_BASIC_INFORMATION>() };
@@ -990,6 +985,14 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
     }
     let mut scans: Vec<ActiveScan> = Vec::new();
     let mut next_scan_id = 0usize;
+
+    // Pre-buffer: rolling window of recent regions that have Lotus paths / anchor keys
+    // but no SubscribedToEmails yet.  Used to recover the true JSON start when the
+    // outer `{` of the FULL_ACCOUNT blob lives in a region that precedes the region
+    // containing SubscribedToEmails (field order varies by account).
+    struct PreChunk { addr: usize, end_addr: usize, data: Vec<u8> }
+    let mut pre_buf: std::collections::VecDeque<PreChunk> = std::collections::VecDeque::new();
+    const PRE_BUF_BYTES: usize = 8 * 1024 * 1024; // keep ≤8 MB of prefix history
 
     let mut addr: usize = 0;
     let mut saved = 0usize;
@@ -1101,43 +1104,83 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
         // Don't open new scans once we already have a result — drain the active ones then exit.
         if found_result { continue; }
 
-        // Require START_MARKER, no mission-delta flag, and a /Lotus/ path.
-        // Short-circuit: only pay for the anchor/lotus/mission checks when has_start is true.
         let t2 = std::time::Instant::now();
-        let has_start = chunk.windows(START_MARKER.len()).any(|w| w == START_MARKER);
-        let qualifies = has_start && {
-            let is_mission = chunk.windows(MISSION_DELTA.len()).any(|w| w == MISSION_DELTA);
-            let has_anchor = ANCHORS.iter().any(|a| chunk.windows(a.len()).any(|w| w == *a));
-            let has_lotus  = chunk.windows(LOTUS_KEY.len()).any(|w| w == LOTUS_KEY);
-            !is_mission && (has_anchor || has_lotus)
-        };
+        let has_start  = chunk.windows(START_MARKER.len()).any(|w| w == START_MARKER);
+        let is_mission = chunk.windows(MISSION_DELTA.len()).any(|w| w == MISSION_DELTA);
+        let has_anchor = ANCHORS.iter().any(|a| chunk.windows(a.len()).any(|w| w == *a));
+        let has_lotus  = chunk.windows(LOTUS_KEY.len()).any(|w| w == LOTUS_KEY);
+        let qualifies  = has_start && !is_mission && (has_anchor || has_lotus);
         t_search += t2.elapsed();
 
+        // Accumulate regions with Lotus paths (no SubscribedToEmails, no mission delta) into
+        // a pre-buffer.  When SubscribedToEmails is found in a later region, we prepend
+        // contiguous pre-buffer regions so that the backward {"  search finds the true
+        // outermost JSON opening rather than a nested {"$oid":…} inside the blob.
+        if !has_start && !is_mission && (has_anchor || has_lotus) {
+            while pre_buf.iter().map(|p| p.data.len()).sum::<usize>() + n > PRE_BUF_BYTES
+                && !pre_buf.is_empty()
+            {
+                pre_buf.pop_front();
+            }
+            pre_buf.push_back(PreChunk { addr: region_addr, end_addr: region_addr + n, data: chunk.to_vec() });
+        }
+
         if qualifies {
-            // Seed from the JSON opening { — field order varies by account so
-            // "SubscribedToEmails" may not be the first field (e.g. relics in
-            // MiscItems appear before it for some players).
-            let start_off = chunk.windows(START_MARKER.len())
+            // Prepend any contiguous pre-buffer regions that immediately precede this one.
+            // This recovers the full blob when the outer { lives in an earlier region and
+            // SubscribedToEmails appears later (field order varies per account/build).
+            let mut combined: Vec<u8> = Vec::new();
+            let mut blob_start_addr = region_addr;
+            {
+                let mut expect_end = region_addr;
+                let mut chain: Vec<usize> = Vec::new();
+                for (i, pc) in pre_buf.iter().enumerate().rev() {
+                    // Allow ≤4 KB alignment gap between regions.
+                    if pc.end_addr <= expect_end && pc.end_addr + 4096 >= expect_end {
+                        chain.push(i);
+                        expect_end = pc.addr;
+                    } else if pc.end_addr < expect_end.saturating_sub(4096) {
+                        break;
+                    }
+                }
+                chain.reverse();
+                for &i in &chain {
+                    let pc = &pre_buf[i];
+                    if combined.is_empty() { blob_start_addr = pc.addr; }
+                    combined.extend_from_slice(&pc.data);
+                }
+            }
+            combined.extend_from_slice(chunk);
+
+            // Find the START_MARKER position within combined, then search backward for
+            // the first {"  — that is the outermost JSON object open.
+            let start_off = combined.windows(START_MARKER.len())
                 .position(|w| w == START_MARKER)
-                .unwrap_or(0);
-            let json_open = chunk[..start_off + 1]
+                .unwrap_or(combined.len().saturating_sub(1));
+            let json_open = combined[..start_off + 1]
                 .windows(2)
                 .position(|w| w == b"{\"")
                 .unwrap_or(start_off);
+
+            // Absolute memory address of the seed start (for LAST_BLOB_REGION cache).
+            let seed_addr = blob_start_addr + json_open;
+
             let id = next_scan_id;
             next_scan_id += 1;
             starts_found += 1;
-            eprintln!("[blob] scan#{} started at 0x{:012x}+{} (json_open={})", id, region_addr, start_off, json_open);
-            let seed = chunk[json_open..].to_vec();
+            let pre_bytes = combined.len() - n;
+            eprintln!(
+                "[blob] scan#{} started at 0x{:012x}+{} (json_open={} seed=0x{:012x} pre={}B)",
+                id, region_addr, start_off, json_open, seed_addr, pre_bytes
+            );
+            let seed = combined[json_open..].to_vec();
 
-            // Check immediately: does this single chunk already contain the full blob?
             if find_blob_end(&seed).is_some() {
                 match parse_full_account_blob(&seed) {
                     Some(inv) => {
                         eprintln!("[blob] scan#{} immediate SUCCESS at 0x{:012x}: {} unique, {} stackable",
                             id, region_addr, inv.unique_items.len(), inv.stackable_items.len());
-                        // region_addr IS the start region here (single-chunk blob).
-                        LAST_BLOB_REGION.store(region_addr as u64, std::sync::atomic::Ordering::Relaxed);
+                        LAST_BLOB_REGION.store(seed_addr as u64, std::sync::atomic::Ordering::Relaxed);
                         if save {
                             let name = format!("Actual_inventory_FULL_ACCOUNT_{}_{:02}.txt", ts, saved + 1);
                             if std::fs::write(blob_dir.join(&name), &seed).is_ok() { saved += 1; }
@@ -1150,7 +1193,7 @@ pub fn capture_all_blobs(blob_dir: &std::path::Path, ts: &str, blob_tx: std::syn
                     }
                 }
             } else {
-                scans.push(ActiveScan { data: seed, id, start_region_addr: region_addr, search_from: 0 });
+                scans.push(ActiveScan { data: seed, id, start_region_addr: seed_addr, search_from: 0 });
             }
         }
     }

@@ -218,10 +218,15 @@
   background: rgba(180, 180, 180, 0.08);
   color: var(--text-dim);
 }
+.syn-item-status.status-subsumed {
+  background: rgba(90, 180, 80, 0.12);
+  color: #5ab450;
+}
 
 /* row-level tinting */
 .syn-item.status-row-blueprint { border-color: rgba(240,192,64,.2); }
 .syn-item.status-row-complete  { border-color: rgba(80,200,120,.2); }
+.syn-item.status-row-subsumed  { border-color: rgba(90,180,80,.2); }
 
 .syn-empty {
   padding: 40px 0;

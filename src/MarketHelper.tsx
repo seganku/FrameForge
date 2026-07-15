@@ -531,7 +531,7 @@ export default function MarketHelper({ inventory, refreshKey, crafting, onWfmLog
           Rivens
         </button>
         <button className={activeMarketTab === "sisters" ? "active" : ""} onClick={() => set("activeMarketTab", "sisters")}>
-          Sisters
+          Variants
         </button>
       </div>
 
